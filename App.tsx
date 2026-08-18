@@ -1,278 +1,546 @@
-import * as React from 'react';
-import {Appearance, Dimensions, StyleSheet, View} from 'react-native';
-
-import {observer} from 'mobx-react';
-import {isHydrated} from 'mobx-persist-store';
-import {NavigationContainer} from '@react-navigation/native';
-import {Provider as PaperProvider} from 'react-native-paper';
-import {BottomSheetModalProvider} from '@gorhom/bottom-sheet';
-import {createDrawerNavigator} from '@react-navigation/drawer';
-import {SafeAreaProvider} from 'react-native-safe-area-context';
-import {KeyboardProvider} from 'react-native-keyboard-controller';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {
-  gestureHandlerRootHOC,
-  GestureHandlerRootView,
-} from 'react-native-gesture-handler';
+  ActivityIndicator,
+  FlatList,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  SafeAreaView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 
-import {uiStore} from './src/store';
-import {useTheme} from './src/hooks';
-import {useDeepLinking} from './src/hooks/useDeepLinking';
-import {Theme} from './src/utils/types';
-
-import {l10n, initLocale} from './src/locales';
-import {L10nContext} from './src/utils';
-import {ROUTES} from './src/utils/navigationConstants';
-
+import {streamChatCompletion, ChatStream} from './src/api/openai';
 import {
-  SidebarContent,
-  ModelsHeaderRight,
-  HeaderLeft,
-  AppWithMigration,
-  DownloadOverlay,
-} from './src/components';
-import {MarkdownProvider} from './src/components/MarkdownView';
-import {BenchmarkRunnerScreen} from './src/__automation__';
-import {
-  ChatScreen,
-  ModelsScreen,
-  SettingsScreen,
-  BenchmarkScreen,
-  AboutScreen,
-  HardwareScreen,
+  clearMessages,
+  loadApiKey,
+  loadMessages,
+  loadSettings,
+  saveApiKey,
+  saveMessages,
+  saveSettings,
+} from './src/storage';
+import {ApiSettings, ChatMessage, DEFAULT_SETTINGS} from './src/types';
 
-  // Dev tools screen. Only available in debug mode.
-  DevToolsScreen,
-} from './src/screens';
-import {OnboardingStack} from './src/screens/OnboardingScreens';
-
-// Check if app is in debug mode
-const isDebugMode = __DEV__;
-
-const Drawer = createDrawerNavigator();
-
-const screenWidth = Dimensions.get('window').width;
-
-// Component that handles deep linking - must be inside NavigationContainer
-const DeepLinkHandler = () => {
-  useDeepLinking();
-  return null;
+const colors = {
+  background: '#101318',
+  surface: '#1a2029',
+  surfaceRaised: '#232b37',
+  border: '#313b4a',
+  text: '#f5f7fa',
+  muted: '#9aa7b7',
+  accent: '#75a7ff',
+  accentPressed: '#5f8fe0',
+  danger: '#ff9b9b',
+  userBubble: '#2c5d9f',
 };
 
-// Branches between the OnboardingStack (first-launch flow) and the main
-// Drawer.Navigator. Both children mount under the same provider tree —
-// switching does NOT remount providers above this point.
-//
-// The hydration check is belt-and-suspenders. AppWithMigrationWrapper
-// already gates render on `isHydrated(uiStore)`, but reading the same
-// observable here keeps the contract local and survives refactors of the
-// outer gate.
-type SwitchPointProps = {drawer: React.ReactNode};
-const SwitchPoint: React.FC<SwitchPointProps> = observer(({drawer}) => {
-  if (!isHydrated(uiStore)) {
-    return null;
-  }
-  if (!uiStore.hasCompletedOnboarding) {
-    return <OnboardingStack />;
-  }
-  return <>{drawer}</>;
-});
+function makeId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
 
-const App = observer(() => {
-  const theme = useTheme();
-  const styles = createStyles(theme);
-  const currentL10n = l10n[uiStore.language];
+function MessageBubble({message}: {message: ChatMessage}) {
+  const isUser = message.role === 'user';
+  return (
+    <View style={[styles.messageRow, isUser && styles.messageRowUser]}>
+      <View style={[styles.messageBubble, isUser && styles.userBubble]}>
+        <Text style={styles.messageRole}>{isUser ? 'You' : 'MobiGPT'}</Text>
+        <Text style={styles.messageText} selectable>
+          {message.content || '…'}
+        </Text>
+      </View>
+    </View>
+  );
+}
 
-  // Initialize locale with the current language
-  React.useEffect(() => {
-    initLocale(uiStore.language);
+export default function App() {
+  const [settings, setSettings] = useState<ApiSettings>(DEFAULT_SETTINGS);
+  const [apiKey, setApiKey] = useState('');
+  const [apiKeyDraft, setApiKeyDraft] = useState('');
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [settingsOpen, setSettingsOpen] = useState(true);
+  const [streaming, setStreaming] = useState(false);
+  const [ready, setReady] = useState(false);
+  const [status, setStatus] = useState('');
+  const streamRef = useRef<ChatStream | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const restore = async () => {
+      try {
+        const [savedSettings, savedMessages] = await Promise.all([
+          loadSettings(),
+          loadMessages(),
+        ]);
+        if (mounted) {
+          setSettings(savedSettings);
+          setMessages(savedMessages);
+        }
+      } catch {
+        if (mounted) {
+          setStatus('Could not restore the previous conversation.');
+        }
+      }
+
+      try {
+        const savedApiKey = await loadApiKey();
+        if (mounted) {
+          setApiKey(savedApiKey);
+          setApiKeyDraft(savedApiKey);
+        }
+      } catch {
+        if (mounted) {
+          setStatus('API key storage is unavailable on this device.');
+        }
+      }
+
+      if (mounted) {
+        setReady(true);
+      }
+    };
+
+    restore();
+    return () => {
+      mounted = false;
+      streamRef.current?.close();
+    };
   }, []);
 
-  return (
-    <GestureHandlerRootView style={styles.root}>
-      <SafeAreaProvider>
-        <KeyboardProvider statusBarTranslucent navigationBarTranslucent>
-          <PaperProvider theme={theme}>
-            <L10nContext.Provider value={currentL10n}>
-              <MarkdownProvider>
-                <NavigationContainer>
-                  <DeepLinkHandler />
-                  <BottomSheetModalProvider>
-                    <SwitchPoint
-                      drawer={
-                        <Drawer.Navigator
-                          screenOptions={{
-                            headerLeft: () => <HeaderLeft />,
-                            drawerStyle: {
-                              width:
-                                screenWidth > 400 ? 320 : screenWidth * 0.8,
-                            },
-                            headerStyle: {
-                              backgroundColor: theme.colors.background,
-                            },
-                            headerTintColor: theme.colors.onBackground,
-                            headerTitleStyle: styles.headerTitle,
-                          }}
-                          drawerContent={props => (
-                            <SidebarContent {...props} />
-                          )}>
-                          <Drawer.Screen
-                            name={ROUTES.CHAT}
-                            component={gestureHandlerRootHOC(ChatScreen)}
-                            options={{
-                              headerShown: false,
-                            }}
-                          />
-                          <Drawer.Screen
-                            name={ROUTES.MODELS}
-                            component={gestureHandlerRootHOC(ModelsScreen)}
-                            options={{
-                              headerRight: () => <ModelsHeaderRight />,
-                              headerStyle: styles.headerWithoutDivider,
-                              title: currentL10n.screenTitles.models,
-                            }}
-                          />
-                          <Drawer.Screen
-                            name={ROUTES.HARDWARE}
-                            component={gestureHandlerRootHOC(HardwareScreen)}
-                            options={{
-                              headerStyle: styles.headerWithoutDivider,
-                              title: 'Hardware',
-                            }}
-                          />
-                          <Drawer.Screen
-                            name={ROUTES.BENCHMARK}
-                            component={gestureHandlerRootHOC(BenchmarkScreen)}
-                            options={{
-                              headerStyle: styles.headerWithoutDivider,
-                              title: currentL10n.screenTitles.benchmark,
-                            }}
-                          />
-                          <Drawer.Screen
-                            name={ROUTES.SETTINGS}
-                            component={gestureHandlerRootHOC(SettingsScreen)}
-                            options={{
-                              headerStyle: styles.headerWithoutDivider,
-                              title: currentL10n.screenTitles.settings,
-                            }}
-                          />
-                          <Drawer.Screen
-                            name={ROUTES.APP_INFO}
-                            component={gestureHandlerRootHOC(AboutScreen)}
-                            options={{
-                              headerStyle: styles.headerWithoutDivider,
-                              title: currentL10n.screenTitles.appInfo,
-                            }}
-                          />
-
-                          {/* Only show Dev Tools screen in debug mode */}
-                          {isDebugMode && (
-                            <Drawer.Screen
-                              name={ROUTES.DEV_TOOLS}
-                              component={gestureHandlerRootHOC(DevToolsScreen)}
-                              options={{
-                                headerStyle: styles.headerWithoutDivider,
-                                title: 'Dev Tools',
-                              }}
-                            />
-                          )}
-
-                          {/*
-                      E2E-only deep-link-driven benchmark matrix runner.
-                      Hidden from the drawer sidebar via
-                      drawerItemStyle:{display:'none'}; reachable only by
-                      the deep link pocketpal://e2e/benchmark in the e2e
-                      flavor build (see useDeepLinking cold-launch effect
-                      and android/app/src/e2e/AndroidManifest.xml).
-                    */}
-                          {__E2E__ && (
-                            <Drawer.Screen
-                              name={ROUTES.BENCHMARK_RUNNER}
-                              component={gestureHandlerRootHOC(
-                                BenchmarkRunnerScreen,
-                              )}
-                              options={{
-                                headerStyle: styles.headerWithoutDivider,
-                                title: 'Benchmark Runner',
-                                drawerItemStyle: {display: 'none'},
-                              }}
-                            />
-                          )}
-                        </Drawer.Navigator>
-                      }
-                    />
-                    <DownloadOverlay />
-                  </BottomSheetModalProvider>
-                </NavigationContainer>
-              </MarkdownProvider>
-            </L10nContext.Provider>
-          </PaperProvider>
-        </KeyboardProvider>
-      </SafeAreaProvider>
-    </GestureHandlerRootView>
-  );
-});
-
-const createStyles = (theme: Theme) =>
-  StyleSheet.create({
-    root: {
-      flex: 1,
-    },
-    headerWithoutDivider: {
-      elevation: 0,
-      shadowOpacity: 0,
-      borderBottomWidth: 0,
-      backgroundColor: theme.colors.background,
-    },
-    headerWithDivider: {
-      backgroundColor: theme.colors.background,
-    },
-    headerTitle: {
-      ...theme.fonts.titleSmall,
-    },
-  });
-
-// Neutral background-only hold, rendered until mobx-persist-store has
-// loaded UIStore from AsyncStorage. It is a single full-screen View whose
-// only meaningful property is backgroundColor, resolved from the system
-// color scheme. Deliberately carries NO branding, NO Text, NO
-// SafeAreaProvider, NO insets, and NO spinner: a flat colored View has
-// nothing to match against either native launch surface (iOS has a branded
-// storyboard, Android has no native launch screen), so it cannot diverge
-// from native on any axis and reads simply as "app launching".
-const splashStyles = StyleSheet.create({
-  light: {flex: 1, backgroundColor: '#ffffff'},
-  dark: {flex: 1, backgroundColor: '#000000'},
-});
-
-const HydrationHold = () => (
-  <View
-    testID="hydration-splash"
-    style={
-      Appearance.getColorScheme() === 'dark'
-        ? splashStyles.dark
-        : splashStyles.light
+  useEffect(() => {
+    if (ready) {
+      saveMessages(messages).catch(() => undefined);
     }
-  />
-);
+  }, [messages, ready]);
 
-// Wrap the App component with AppWithMigration to show migration UI when
-// needed. Gates the first render of any theme-consuming subtree on
-// mobx-persist-store hydration so persisted `language` and `colorScheme`
-// are observed on first paint.
-//
-// The gate must wrap App itself (App calls useTheme() BEFORE <PaperProvider>
-// mounts), so AppWithMigrationWrapper — which sits above App and has no
-// theme dependency — is the chosen host. While unhydrated it renders the
-// neutral background-only hold above.
-const AppWithMigrationWrapper = observer(() => {
-  if (!isHydrated(uiStore)) {
-    return <HydrationHold />;
-  }
-  return (
-    <AppWithMigration>
-      <App />
-    </AppWithMigration>
+  const stopGeneration = useCallback(() => {
+    streamRef.current?.close();
+    streamRef.current = null;
+    setStreaming(false);
+  }, []);
+
+  const updateSettings = useCallback(
+    <K extends keyof ApiSettings>(key: K, value: ApiSettings[K]) => {
+      setSettings(previous => ({...previous, [key]: value}));
+    },
+    [],
   );
-});
 
-export default AppWithMigrationWrapper;
+  const persistSettings = useCallback(async () => {
+    try {
+      await Promise.all([saveSettings(settings), saveApiKey(apiKeyDraft)]);
+      setApiKey(apiKeyDraft.trim());
+      setStatus('Settings saved.');
+      setSettingsOpen(false);
+    } catch {
+      setStatus('Could not save settings on this device.');
+    }
+  }, [apiKeyDraft, settings]);
+
+  const startNewChat = useCallback(async () => {
+    stopGeneration();
+    setMessages([]);
+    setStatus('');
+    await clearMessages();
+  }, [stopGeneration]);
+
+  const sendMessage = useCallback(() => {
+    const content = input.trim();
+    if (!content || streaming) {
+      return;
+    }
+
+    if (!apiKey.trim() || !settings.baseUrl.trim() || !settings.model.trim()) {
+      setSettingsOpen(true);
+      setStatus(
+        'Add an API key, base URL, and model before sending a message.',
+      );
+      return;
+    }
+
+    const userMessage: ChatMessage = {
+      id: makeId(),
+      role: 'user',
+      content,
+      createdAt: Date.now(),
+    };
+    const assistantMessage: ChatMessage = {
+      id: makeId(),
+      role: 'assistant',
+      content: '',
+      createdAt: Date.now(),
+    };
+    const requestMessages = [
+      ...(settings.systemPrompt.trim()
+        ? [{role: 'system' as const, content: settings.systemPrompt.trim()}]
+        : []),
+      ...messages.map(message => ({
+        role: message.role,
+        content: message.content,
+      })),
+      {role: 'user' as const, content},
+    ];
+
+    setInput('');
+    setStatus('');
+    setMessages(previous => [...previous, userMessage, assistantMessage]);
+    setStreaming(true);
+
+    const stream = streamChatCompletion(
+      settings,
+      apiKey,
+      requestMessages,
+      delta => {
+        setMessages(previous =>
+          previous.map(message =>
+            message.id === assistantMessage.id
+              ? {...message, content: message.content + delta}
+              : message,
+          ),
+        );
+      },
+    );
+    streamRef.current = stream;
+
+    stream.done
+      .catch(error => {
+        setMessages(previous =>
+          previous.map(message =>
+            message.id === assistantMessage.id && !message.content
+              ? {...message, content: `Error: ${error.message}`}
+              : message,
+          ),
+        );
+        setStatus(
+          error instanceof Error ? error.message : 'The API request failed.',
+        );
+      })
+      .finally(() => {
+        streamRef.current = null;
+        setStreaming(false);
+      });
+  }, [apiKey, input, messages, settings, streaming]);
+
+  if (!ready) {
+    return (
+      <SafeAreaView style={styles.loadingScreen}>
+        <StatusBar
+          barStyle="light-content"
+          backgroundColor={colors.background}
+        />
+        <ActivityIndicator color={colors.accent} />
+        <Text style={styles.loadingText}>Loading MobiGPT…</Text>
+      </SafeAreaView>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.screen}>
+      <StatusBar barStyle="light-content" backgroundColor={colors.background} />
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <View style={styles.header}>
+          <View>
+            <Text style={styles.title}>MobiGPT</Text>
+            <Text style={styles.subtitle}>OpenAI-compatible mobile chat</Text>
+          </View>
+          <View style={styles.headerActions}>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => setSettingsOpen(previous => !previous)}
+              style={({pressed}) => [
+                styles.headerButton,
+                pressed && styles.pressed,
+              ]}>
+              <Text style={styles.headerButtonText}>Settings</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={startNewChat}
+              style={({pressed}) => [
+                styles.headerButton,
+                pressed && styles.pressed,
+              ]}>
+              <Text style={styles.headerButtonText}>New</Text>
+            </Pressable>
+          </View>
+        </View>
+
+        {settingsOpen && (
+          <View style={styles.settingsPanel}>
+            <Text style={styles.sectionTitle}>Connection</Text>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="url"
+              onChangeText={value => updateSettings('baseUrl', value)}
+              placeholder="https://api.openai.com/v1"
+              placeholderTextColor={colors.muted}
+              style={styles.input}
+              value={settings.baseUrl}
+            />
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={setApiKeyDraft}
+              placeholder="API key (stored in the device keychain)"
+              placeholderTextColor={colors.muted}
+              secureTextEntry
+              style={styles.input}
+              value={apiKeyDraft}
+            />
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={value => updateSettings('model', value)}
+              placeholder="Model name"
+              placeholderTextColor={colors.muted}
+              style={styles.input}
+              value={settings.model}
+            />
+            <View style={styles.settingsRow}>
+              <TextInput
+                keyboardType="decimal-pad"
+                onChangeText={value =>
+                  updateSettings('temperature', Number(value) || 0)
+                }
+                placeholder="Temperature"
+                placeholderTextColor={colors.muted}
+                style={[styles.input, styles.halfInput]}
+                value={String(settings.temperature)}
+              />
+              <TextInput
+                keyboardType="number-pad"
+                onChangeText={value =>
+                  updateSettings('maxTokens', Number(value) || 1)
+                }
+                placeholder="Max tokens"
+                placeholderTextColor={colors.muted}
+                style={[styles.input, styles.halfInput]}
+                value={String(settings.maxTokens)}
+              />
+            </View>
+            <TextInput
+              multiline
+              onChangeText={value => updateSettings('systemPrompt', value)}
+              placeholder="System prompt"
+              placeholderTextColor={colors.muted}
+              style={[styles.input, styles.promptInput]}
+              value={settings.systemPrompt}
+            />
+            <Pressable
+              accessibilityRole="button"
+              onPress={persistSettings}
+              style={({pressed}) => [
+                styles.primaryButton,
+                pressed && styles.pressed,
+              ]}>
+              <Text style={styles.primaryButtonText}>Save settings</Text>
+            </Pressable>
+            <Text style={styles.securityNote}>
+              For production use, prefer a trusted proxy so a provider key is
+              not exposed directly from a mobile app.
+            </Text>
+          </View>
+        )}
+
+        {status ? <Text style={styles.status}>{status}</Text> : null}
+
+        <FlatList
+          contentContainerStyle={styles.messages}
+          data={messages}
+          keyExtractor={message => message.id}
+          ListEmptyComponent={
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyTitle}>Start a conversation</Text>
+              <Text style={styles.emptyText}>
+                Add your OpenAI-compatible endpoint and API key, then send a
+                message.
+              </Text>
+            </View>
+          }
+          renderItem={({item}) => <MessageBubble message={item} />}
+        />
+
+        <View style={styles.composer}>
+          <TextInput
+            editable={!streaming}
+            multiline
+            onChangeText={setInput}
+            onSubmitEditing={sendMessage}
+            placeholder={
+              streaming ? 'MobiGPT is responding…' : 'Message MobiGPT'
+            }
+            placeholderTextColor={colors.muted}
+            returnKeyType="send"
+            style={styles.composerInput}
+            value={input}
+          />
+          <Pressable
+            accessibilityRole="button"
+            disabled={streaming ? false : !input.trim()}
+            onPress={streaming ? stopGeneration : sendMessage}
+            style={({pressed}) => [
+              styles.sendButton,
+              !streaming && !input.trim() && styles.disabled,
+              pressed && styles.pressed,
+            ]}>
+            <Text style={styles.sendButtonText}>
+              {streaming ? 'Stop' : 'Send'}
+            </Text>
+          </Pressable>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  flex: {flex: 1},
+  screen: {flex: 1, backgroundColor: colors.background},
+  loadingScreen: {
+    alignItems: 'center',
+    backgroundColor: colors.background,
+    flex: 1,
+    justifyContent: 'center',
+  },
+  loadingText: {color: colors.muted, marginTop: 12},
+  header: {
+    alignItems: 'center',
+    borderBottomColor: colors.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  title: {color: colors.text, fontSize: 22, fontWeight: '700'},
+  subtitle: {color: colors.muted, fontSize: 12, marginTop: 2},
+  headerActions: {flexDirection: 'row', gap: 8},
+  headerButton: {
+    borderColor: colors.border,
+    borderRadius: 8,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  headerButtonText: {color: colors.text, fontSize: 12, fontWeight: '600'},
+  settingsPanel: {
+    backgroundColor: colors.surface,
+    borderBottomColor: colors.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    padding: 14,
+  },
+  sectionTitle: {
+    color: colors.text,
+    fontSize: 15,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  input: {
+    backgroundColor: colors.surfaceRaised,
+    borderColor: colors.border,
+    borderRadius: 8,
+    borderWidth: 1,
+    color: colors.text,
+    fontSize: 14,
+    marginBottom: 8,
+    paddingHorizontal: 11,
+    paddingVertical: 9,
+  },
+  settingsRow: {flexDirection: 'row', gap: 8},
+  halfInput: {flex: 1},
+  promptInput: {minHeight: 64, textAlignVertical: 'top'},
+  primaryButton: {
+    alignItems: 'center',
+    backgroundColor: colors.accent,
+    borderRadius: 8,
+    paddingVertical: 10,
+  },
+  primaryButtonText: {color: '#08101e', fontWeight: '700'},
+  securityNote: {
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 15,
+    marginTop: 8,
+  },
+  status: {
+    color: colors.danger,
+    fontSize: 12,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+  },
+  messages: {flexGrow: 1, padding: 16},
+  emptyState: {
+    alignItems: 'center',
+    flex: 1,
+    justifyContent: 'center',
+    padding: 24,
+  },
+  emptyTitle: {
+    color: colors.text,
+    fontSize: 20,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  emptyText: {color: colors.muted, lineHeight: 20, textAlign: 'center'},
+  messageRow: {alignItems: 'flex-start', marginBottom: 12},
+  messageRowUser: {alignItems: 'flex-end'},
+  messageBubble: {
+    backgroundColor: colors.surface,
+    borderColor: colors.border,
+    borderRadius: 12,
+    borderWidth: 1,
+    maxWidth: '88%',
+    padding: 12,
+  },
+  userBubble: {
+    backgroundColor: colors.userBubble,
+    borderColor: colors.userBubble,
+  },
+  messageRole: {
+    color: colors.muted,
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  messageText: {color: colors.text, fontSize: 15, lineHeight: 21},
+  composer: {
+    alignItems: 'flex-end',
+    backgroundColor: colors.surface,
+    borderTopColor: colors.border,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    gap: 8,
+    padding: 10,
+  },
+  composerInput: {
+    backgroundColor: colors.surfaceRaised,
+    borderColor: colors.border,
+    borderRadius: 10,
+    borderWidth: 1,
+    color: colors.text,
+    flex: 1,
+    maxHeight: 120,
+    minHeight: 44,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    textAlignVertical: 'top',
+  },
+  sendButton: {
+    alignItems: 'center',
+    backgroundColor: colors.accent,
+    borderRadius: 10,
+    justifyContent: 'center',
+    minHeight: 44,
+    paddingHorizontal: 15,
+  },
+  sendButtonText: {color: '#08101e', fontWeight: '700'},
+  disabled: {backgroundColor: colors.border},
+  pressed: {opacity: 0.76},
+});
