@@ -154,7 +154,7 @@ jobs:
           profile: pixel_2
           emulator-boot-timeout: 900
           disable-animations: false
-          script: adb install -r release/MobiGPT-api-release-x86_64.apk && adb shell am force-stop com.pocketpallite && adb logcat -c && adb shell am start -W -n com.pocketpallite/com.pocketpal.MainActivity && sleep 8 && adb shell dumpsys activity activities | grep -q 'mResumedActivity.*com.pocketpallite' || (adb logcat -d -t 500 && exit 1)
+          script: adb install -r release/MobiGPT-api-release-x86_64.apk && adb shell am force-stop com.pocketpallite && adb logcat -c && adb shell am start -W -n com.pocketpallite/com.pocketpal.MainActivity | grep -q 'Status: ok' && sleep 8 && (adb shell pidof com.pocketpallite || adb shell dumpsys activity top | grep -q 'com.pocketpallite/com.pocketpal.MainActivity') || (adb logcat -d -t 500 && exit 1)
 
   build_debug:
     name: Build manual debug APK
