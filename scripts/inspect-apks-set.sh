@@ -32,6 +32,7 @@ mapfile -t APKS < <(find "$APK_DIR" -type f -name '*.apk' -print | sort)
 
 failures=()
 base_seen=0
+metadata_seen=0
 abi_seen=0
 for apk in "${APKS[@]}"; do
   badging=$($AAPT dump badging "$apk")
@@ -41,11 +42,11 @@ for apk in "${APKS[@]}"; do
     # A bundletool set contains multiple base/configuration splits. The base
     # split is identified by the package metadata; only it should be required
     # to expose label, launcher, and version metadata.
-    if ((base_seen == 0)); then
-      base_seen=1
-      grep -Fq "'$LABEL'" <<<"$(grep -E '^application-label' <<<"$badging" || true)" || failures+=("$apk: expected label '$LABEL'")
-      grep -Fq "name='$LAUNCHER'" <<<"$(grep -E '^launchable-activity:' <<<"$badging" || true)" || failures+=("$apk: expected launcher '$LAUNCHER'")
-      grep -Eq '^package: .*versionCode=.*versionName=' <<<"$badging" || failures+=("$apk: missing version metadata")
+    base_seen=1
+    if grep -Fq "'$LABEL'" <<<"$(grep -E '^application-label' <<<"$badging" || true)" \
+      && grep -Fq "name='$LAUNCHER'" <<<"$(grep -E '^launchable-activity:' <<<"$badging" || true)" \
+      && grep -Eq '^package: .*versionCode=.*versionName=' <<<"$badging"; then
+      metadata_seen=1
     fi
   fi
   if grep -Fq "lib/$EXPECTED_ABI/" <<<"$zip_list"; then
@@ -57,6 +58,7 @@ done
 # Split APK sets distribute native libraries among configuration splits, so the
 # ABI is expected in at least one member rather than in the base APK alone.
 ((base_seen == 1)) || failures+=("no base split exposed package ID '$PACKAGE_ID'")
+((metadata_seen == 1)) || failures+=("no split exposed complete label/launcher/version metadata")
 ((abi_seen == 1)) || failures+=("no split contained lib/$EXPECTED_ABI native libraries")
 
 {
@@ -65,6 +67,7 @@ done
   echo "Split count: ${#APKS[@]}"
   echo "Expected ABI: $EXPECTED_ABI"
   echo "Base package found: $base_seen"
+  echo "Complete metadata found: $metadata_seen"
   echo "Expected ABI found: $abi_seen"
   if ((${#failures[@]} == 0)); then
     echo "RESULT: PASS"

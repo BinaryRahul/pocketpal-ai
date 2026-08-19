@@ -347,6 +347,10 @@ jobs:
         with:
           name: MobiGPT-api-release-arm64-v8a
           path: release
+      - name: Set up Android SDK on ARM64 runner
+        uses: android-actions/setup-android@v4
+      - name: Install ARM64 emulator packages
+        run: sdkmanager 'platform-tools' 'emulator' 'platforms;android-30' 'system-images;android-30;default;arm64-v8a'
       - name: Install and launch exact ARM64 release APK twice
         uses: reactivecircus/android-emulator-runner@v2
         with:
