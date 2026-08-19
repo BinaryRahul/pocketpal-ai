@@ -80,6 +80,11 @@ jobs:
         run: yarn install --frozen-lockfile --non-interactive
       - name: Build optimized release APK
         run: cd android && ./gradlew assembleRelease -PtargetAbi=${{ matrix.abi }} -PreactNativeArchitectures=${{ matrix.abi }}
+      - name: Verify APK contains only the requested ABI
+        run: |
+          actual=$(unzip -Z1 android/app/build/outputs/apk/release/app-release.apk | awk -F/ '$1 == "lib" && NF >= 2 {print $2}' | sort -u)
+          printf 'Requested ABI: %s\nPackaged ABI(s):\n%s\n' '${{ matrix.abi }}' "$actual"
+          test "$actual" = '${{ matrix.abi }}'
       - name: Rename APK and generate checksum
         run: |
           mkdir -p output
