@@ -36,11 +36,17 @@ abi_seen=0
 for apk in "${APKS[@]}"; do
   badging=$($AAPT dump badging "$apk")
   zip_list=$(unzip -Z1 "$apk")
-  if grep -Fq "name='$PACKAGE_ID'" <<<"$(grep -E '^package:' <<<"$badging" || true)"; then
-    base_seen=1
-    grep -Fq "'$LABEL'" <<<"$(grep -E '^application-label' <<<"$badging" || true)" || failures+=("$apk: expected label '$LABEL'")
-    grep -Fq "name='$LAUNCHER'" <<<"$(grep -E '^launchable-activity:' <<<"$badging" || true)" || failures+=("$apk: expected launcher '$LAUNCHER'")
-    grep -Eq '^package: .*versionCode=.*versionName=' <<<"$badging" || failures+=("$apk: missing version metadata")
+  package_line=$(grep -E '^package:' <<<"$badging" || true)
+  if grep -Fq "name='$PACKAGE_ID'" <<<"$package_line"; then
+    # A bundletool set contains multiple base/configuration splits. The base
+    # split is identified by the package metadata; only it should be required
+    # to expose label, launcher, and version metadata.
+    if ((base_seen == 0)); then
+      base_seen=1
+      grep -Fq "'$LABEL'" <<<"$(grep -E '^application-label' <<<"$badging" || true)" || failures+=("$apk: expected label '$LABEL'")
+      grep -Fq "name='$LAUNCHER'" <<<"$(grep -E '^launchable-activity:' <<<"$badging" || true)" || failures+=("$apk: expected launcher '$LAUNCHER'")
+      grep -Eq '^package: .*versionCode=.*versionName=' <<<"$badging" || failures+=("$apk: missing version metadata")
+    fi
   fi
   if grep -Fq "lib/$EXPECTED_ABI/" <<<"$zip_list"; then
     abi_seen=1

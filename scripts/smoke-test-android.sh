@@ -114,9 +114,11 @@ run_attempt() {
     grep -E "$PACKAGE_ID|ReactNativeJS|SoLoader|Hermes|CxxInspectorPackagerConnection|InspectorFlags" "$log_file" > "$app_log" || true
   fi
 
-  # Include system_server activity termination lines in the app log because
-  # Android reports the force-finish there rather than in the app process.
-  grep -E "${PACKAGE_ID}|ReactNativeJS|SoLoader|Hermes|CxxInspectorPackagerConnection|InspectorFlags|FATAL EXCEPTION|ClassNotFoundException|NoSuchMethodException|UnsatisfiedLinkError|SIGSEGV|SIGABRT|Abort message|ExceptionInInitializerError|Force finishing activity" "$log_file" >> "$app_log" || true
+  # Include only app/package-specific lines plus the system_server activity
+  # termination line. Do not scan the whole emulator log: Android Settings and
+  # other system services legitimately emit NoSuchMethodException and
+  # ClassNotFoundException warnings that are unrelated to MobiGPT.
+  grep -E "${PACKAGE_ID}|ReactNativeJS|SoLoader|Hermes|CxxInspectorPackagerConnection|InspectorFlags|Force finishing activity ${PACKAGE_ID}" "$log_file" >> "$app_log" || true
 
   if grep -Eq 'FATAL EXCEPTION|ClassNotFoundException|NoSuchMethodException|UnsatisfiedLinkError|SIGSEGV|SIGABRT|Abort message|ExceptionInInitializerError|Force finishing activity' "$app_log"; then
     cat "$app_log" >&2
