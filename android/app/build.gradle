@@ -6,7 +6,9 @@ react {
     autolinkLibrariesWithApp()
 }
 
-def enableProguardInReleaseBuilds = true
+// Keep optimized shrinking enabled by default. The property is a manual diagnostic
+// escape hatch only; normal CI release artifacts remain R8/resource-shrunk.
+def enableProguardInReleaseBuilds = project.findProperty("disableReleaseShrinking")?.toString() != "true"
 def targetAbi = project.findProperty("targetAbi")?.toString()
 
 def releaseStorePassword = System.getenv("APP_RELEASE_STORE_PASSWORD")
