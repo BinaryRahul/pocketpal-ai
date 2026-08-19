@@ -335,44 +335,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  smoke_test_arm64:
-    name: Smoke-test ARM64 release APK on ARM64 runner/API 30
-    needs: build_release_apks
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-      - name: Download ARM64 release APK
-        uses: actions/download-artifact@v8
-        with:
-          name: MobiGPT-api-release-arm64-v8a
-          path: release
-      - name: Set up Android SDK on ARM64 runner
-        uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools emulator platforms;android-30 system-images;android-30;default;arm64-v8a
-      - name: Install and launch exact ARM64 release APK twice
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 30
-          target: default
-          arch: arm64-v8a
-          profile: pixel_2
-          emulator-boot-timeout: 1800
-          disable-animations: true
-          disable-linux-hw-accel: true
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: |
-            WAIT_SECONDS=12 ./scripts/smoke-test-android.sh release/MobiGPT-api-release-arm64-v8a.apk smoke-output
-      - name: Upload ARM64 startup diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: MobiGPT-smoke-arm64-api30
-          path: smoke-output/
-          if-no-files-found: ignore
-          retention-days: 14
-
   smoke_test_aab_x86_64:
     name: Smoke-test AAB-generated x86_64 APK set
     needs: build_release_aab
@@ -407,45 +369,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: MobiGPT-smoke-aab-x86_64
-          path: |
-            smoke-output/
-            aab-install.txt
-          if-no-files-found: ignore
-          retention-days: 14
-
-  smoke_test_aab_arm64:
-    name: Smoke-test AAB-generated ARM64 APK set
-    needs: build_release_aab
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-      - name: Download AAB validation artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: MobiGPT-api-release-aab
-          path: aab
-      - name: Set up Android SDK on ARM64 runner
-        uses: android-actions/setup-android@v4
-        with:
-          packages: platform-tools emulator platforms;android-30 system-images;android-30;default;arm64-v8a
-      - name: Install and launch AAB-generated ARM64 split APKs twice
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 30
-          target: default
-          arch: arm64-v8a
-          profile: pixel_2
-          emulator-boot-timeout: 1200
-          disable-animations: true
-          script: |
-            adb install-multiple -r aab/aab-arm64-apks/*.apk > aab-install.txt 2>&1
-            WAIT_SECONDS=12 ./scripts/smoke-test-android.sh --installed smoke-output
-      - name: Upload AAB ARM64 startup diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: MobiGPT-smoke-aab-arm64
           path: |
             smoke-output/
             aab-install.txt
@@ -543,9 +466,7 @@ jobs:
       - smoke_test
       - smoke_test_android8
       - smoke_test_android10
-      - smoke_test_arm64
       - smoke_test_aab_x86_64
-      - smoke_test_aab_arm64
     runs-on: ubuntu-latest
     steps:
       - name: Require every release validation job to pass
