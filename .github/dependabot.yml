@@ -1,0 +1,48 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: '/'
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - full-release-validation
+    groups:
+      react-native-runtime:
+        patterns:
+          - 'react'
+          - 'react-dom'
+          - 'react-native'
+          - '@react-native/*'
+          - 'hermes*'
+      native-modules:
+        patterns:
+          - '@react-native-async-storage/*'
+          - 'react-native-keychain'
+          - 'react-native-sse'
+          - 'react-native-url-polyfill'
+
+  - package-ecosystem: gradle
+    directory: '/android'
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - full-release-validation
+    groups:
+      android-build:
+        patterns:
+          - 'com.android.tools.build:gradle'
+          - 'com.facebook.react:react-native-gradle-plugin'
+          - 'org.jetbrains.kotlin:kotlin-gradle-plugin'
+
+  - package-ecosystem: github-actions
+    directory: '/'
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - full-release-validation

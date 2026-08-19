@@ -1,0 +1,110 @@
+name: MobiGPT ARM64 device validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful main-workflow run ID containing the exact release artifact
+        required: true
+        type: string
+      artifact_name:
+        description: ARM64 release artifact name
+        required: false
+        default: MobiGPT-api-release-arm64-v8a
+        type: string
+      ref:
+        description: Repository ref containing the validation scripts
+        required: false
+        default: openai-only-clean
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: mobigpt-device-farm-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE_ID: com.pocketpallite
+  LAUNCHER_ACTIVITY: com.pocketpal.MainActivity
+  RELEASE_WAIT_SECONDS: 15
+
+jobs:
+  physical_arm64_release:
+    name: Validate exact ARM64 release on connected physical device
+    # Configure a self-hosted runner with labels:
+    # self-hosted, linux, arm64, android-device
+    # The runner must have adb, Android SDK build-tools, curl, jq, unzip,
+    # and a USB/network-connected Android ARM64 device authorized for adb.
+    runs-on: [self-hosted, linux, arm64, android-device]
+    timeout-minutes: 30
+    steps:
+      - name: Check out validation scripts
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Verify runner tools and connected ARM64 device
+        run: |
+          command -v adb
+          command -v curl
+          command -v jq
+          command -v unzip
+          adb start-server
+          adb devices
+          device_count=$(adb devices | awk 'NR > 1 && $2 == "device" {count++} END {print count + 0}')
+          test "$device_count" = 1
+          serial=$(adb devices | awk 'NR > 1 && $2 == "device" {print $1; exit}')
+          echo "ADB_SERIAL=$serial" >> "$GITHUB_ENV"
+          abi=$(adb -s "$serial" shell getprop ro.product.cpu.abi | tr -d '\r')
+          sdk=$(adb -s "$serial" shell getprop ro.build.version.sdk | tr -d '\r')
+          echo "Device ABI: $abi"
+          echo "Device SDK: $sdk"
+          test "$abi" = arm64-v8a
+          test "$sdk" -ge 27
+      - name: Download exact release artifact from the selected run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          artifact_id=$(curl --fail --location \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+            | jq -r --arg name "$ARTIFACT_NAME" '.artifacts[] | select(.name == $name and .expired == false) | .id' | head -n 1)
+          test -n "$artifact_id" && test "$artifact_id" != null
+          mkdir -p release
+          curl --fail --location \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+            --output release/artifact.zip
+          unzip -o release/artifact.zip -d release/artifact
+          apk=$(find release/artifact -type f -name '*.apk' | head -n 1)
+          test -n "$apk"
+          cp "$apk" release/MobiGPT-arm64-release.apk
+          sha256sum release/MobiGPT-arm64-release.apk | tee release/MobiGPT-arm64-release.apk.sha256
+      - name: Inspect exact ARM64 artifact before installation
+        run: |
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2" \
+            ./scripts/inspect-apk.sh release/MobiGPT-arm64-release.apk arm64-v8a release/apk-inspection.txt
+      - name: Install exact artifact and run two cold starts
+        env:
+          ADB_SERIAL: ${{ env.ADB_SERIAL }}
+        run: |
+          mkdir -p device-output
+          adb -s "$ADB_SERIAL" install -r release/MobiGPT-arm64-release.apk > device-output/install.txt 2>&1
+          WAIT_SECONDS=15 ADB_SERIAL="$ADB_SERIAL" \
+            ./scripts/smoke-test-android.sh --installed device-output
+      - name: Upload physical-device diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MobiGPT-device-farm-${{ inputs.run_id }}
+          path: |
+            release/
+            device-output/
+          if-no-files-found: warn
+          retention-days: 30

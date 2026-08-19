@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - openai-only-clean
+  pull_request:
+    branches:
+      - openai-only-clean
   workflow_dispatch:
     inputs:
       build_debug:
@@ -23,6 +26,12 @@ permissions:
 concurrency:
   group: mobigpt-api-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  PACKAGE_ID: com.pocketpallite
+  LAUNCHER_ACTIVITY: com.pocketpal.MainActivity
+  RELEASE_WAIT_SECONDS: 12
+  BUNDLETOOL_VERSION: 1.18.2
 
 jobs:
   checks:
@@ -46,6 +55,10 @@ jobs:
         run: yarn lint
       - name: Run focused tests
         run: yarn test
+      - name: Validate CI scripts and repository whitespace
+        run: |
+          bash -n scripts/*.sh
+          git diff --check
 
   build_release_apks:
     name: Build optimized ${{ matrix.abi }} release APK
@@ -80,17 +93,31 @@ jobs:
         run: yarn install --frozen-lockfile --non-interactive
       - name: Build optimized release APK
         run: cd android && ./gradlew assembleRelease -PtargetAbi=${{ matrix.abi }} -PreactNativeArchitectures=${{ matrix.abi }}
-      - name: Verify APK contains only the requested ABI
+      - name: Validate R8 runtime contracts
         run: |
-          actual=$(unzip -Z1 android/app/build/outputs/apk/release/app-release.apk | awk -F/ '$1 == "lib" && NF >= 2 {print $2}' | sort -u)
-          printf 'Requested ABI: %s\nPackaged ABI(s):\n%s\n' '${{ matrix.abi }}' "$actual"
-          test "$actual" = '${{ matrix.abi }}'
+          mkdir -p output/r8
+          if [[ -d android/app/build/outputs/mapping/release ]]; then
+            cp -a android/app/build/outputs/mapping/release/. output/r8/
+          fi
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2" \
+            ./scripts/validate-r8-contracts.sh \
+            android/release-runtime-contracts.txt \
+            android/app/build/outputs/mapping/release \
+            output/r8-contracts-${{ matrix.abi }}.txt
+      - name: Inspect exact optimized APK
+        run: |
+          mkdir -p output
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2" \
+            ./scripts/inspect-apk.sh \
+            android/app/build/outputs/apk/release/app-release.apk \
+            '${{ matrix.abi }}' \
+            output/apk-inspection-${{ matrix.abi }}.txt
       - name: Rename APK and generate checksum
         run: |
           mkdir -p output
           cp android/app/build/outputs/apk/release/app-release.apk output/MobiGPT-api-release-${{ matrix.abi }}.apk
           sha256sum output/MobiGPT-api-release-${{ matrix.abi }}.apk | tee output/MobiGPT-api-release-${{ matrix.abi }}.apk.sha256
-      - name: Upload optimized release APK
+      - name: Upload optimized release APK and diagnostics
         uses: actions/upload-artifact@v7
         with:
           name: MobiGPT-api-release-${{ matrix.abi }}
@@ -99,7 +126,7 @@ jobs:
           retention-days: 14
 
   build_release_aab:
-    name: Build optimized release AAB
+    name: Build optimized release AAB and validate generated APK sets
     needs: checks
     runs-on: ubuntu-latest
     steps:
@@ -120,17 +147,66 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
       - name: Install Android SDK packages
-        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
       - name: Install JavaScript dependencies
         run: yarn install --frozen-lockfile --non-interactive
       - name: Build optimized release AAB
         run: cd android && ./gradlew bundleRelease
+      - name: Download pinned bundletool
+        run: |
+          curl --fail --location --retry 3 \
+            "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar" \
+            --output bundletool.jar
+      - name: Validate AAB and create validation signing key
+        run: |
+          java -jar bundletool.jar validate --bundle android/app/build/outputs/bundle/release/app-release.aab
+          keytool -genkeypair -v \
+            -keystore validation.keystore \
+            -storepass android \
+            -keypass android \
+            -alias validation \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname 'CN=MobiGPT CI, OU=Validation, O=MobiGPT, C=US'
+      - name: Build and inspect ARM64 and x86_64 APK sets
+        run: |
+          mkdir -p output/aab-arm64-apks output/aab-x86_64-apks
+          cat > arm64-device.json <<'JSON'
+          {"supportedAbis":["arm64-v8a"],"supportedLocales":["en"],"screenDensity":420,"sdkVersion":30}
+          JSON
+          cat > x86_64-device.json <<'JSON'
+          {"supportedAbis":["x86_64"],"supportedLocales":["en"],"screenDensity":420,"sdkVersion":35}
+          JSON
+          java -jar bundletool.jar build-apks \
+            --bundle android/app/build/outputs/bundle/release/app-release.aab \
+            --output output/aab-arm64.apks \
+            --device-spec arm64-device.json \
+            --ks validation.keystore \
+            --ks-pass pass:android \
+            --ks-key-alias validation \
+            --key-pass pass:android \
+            --overwrite
+          java -jar bundletool.jar build-apks \
+            --bundle android/app/build/outputs/bundle/release/app-release.aab \
+            --output output/aab-x86_64.apks \
+            --device-spec x86_64-device.json \
+            --ks validation.keystore \
+            --ks-pass pass:android \
+            --ks-key-alias validation \
+            --key-pass pass:android \
+            --overwrite
+          java -jar bundletool.jar extract-apks --apks output/aab-arm64.apks --output-dir output/aab-arm64-apks
+          java -jar bundletool.jar extract-apks --apks output/aab-x86_64.apks --output-dir output/aab-x86_64-apks
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2" \
+            ./scripts/inspect-apks-set.sh output/aab-arm64-apks arm64-v8a output/aab-arm64-inspection.txt
+          AAPT2="$ANDROID_HOME/build-tools/36.0.0/aapt2" \
+            ./scripts/inspect-apks-set.sh output/aab-x86_64-apks x86_64 output/aab-x86_64-inspection.txt
       - name: Rename AAB and generate checksum
         run: |
-          mkdir -p output
           cp android/app/build/outputs/bundle/release/app-release.aab output/MobiGPT-api-release.aab
           sha256sum output/MobiGPT-api-release.aab | tee output/MobiGPT-api-release.aab.sha256
-      - name: Upload release AAB
+      - name: Upload release AAB and generated APK sets
         uses: actions/upload-artifact@v7
         with:
           name: MobiGPT-api-release-aab
@@ -139,7 +215,7 @@ jobs:
           retention-days: 14
 
   smoke_test:
-    name: Smoke-test x86_64 release APK
+    name: Smoke-test x86_64 release APK on Android 15/API 35
     needs: build_release_apks
     runs-on: ubuntu-latest
     steps:
@@ -155,7 +231,7 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Install and launch release APK in emulator
+      - name: Install and launch exact release APK twice
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 35
@@ -163,12 +239,20 @@ jobs:
           arch: x86_64
           profile: pixel_2
           emulator-boot-timeout: 900
-          disable-animations: false
+          disable-animations: true
           script: |
-            adb install -r release/MobiGPT-api-release-x86_64.apk && adb shell am force-stop com.pocketpallite && adb logcat -c && adb shell am start -W -n com.pocketpallite/com.pocketpal.MainActivity | grep -q 'Status: ok' && sleep 8 && (adb shell pidof com.pocketpallite || adb shell dumpsys activity top | grep -q 'com.pocketpallite/com.pocketpal.MainActivity') || (adb logcat -d -t 500 && exit 1)
+            WAIT_SECONDS=12 ./scripts/smoke-test-android.sh release/MobiGPT-api-release-x86_64.apk smoke-output
+      - name: Upload startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MobiGPT-smoke-api35
+          path: smoke-output/
+          if-no-files-found: warn
+          retention-days: 14
 
   smoke_test_android8:
-    name: Smoke-test release APK on Android 8.1
+    name: Smoke-test x86_64 release APK on Android 8.1/API 27
     needs: build_release_apks
     runs-on: ubuntu-latest
     steps:
@@ -184,7 +268,7 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Install and launch release APK on Android 8.1
+      - name: Install and launch exact release APK twice
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 27
@@ -192,9 +276,171 @@ jobs:
           arch: x86_64
           profile: pixel_2
           emulator-boot-timeout: 900
-          disable-animations: false
+          disable-animations: true
           script: |
-            adb install -r release/MobiGPT-api-release-x86_64.apk && adb shell am force-stop com.pocketpallite && adb logcat -c && adb shell am start -W -n com.pocketpallite/com.pocketpal.MainActivity | grep -q 'Status: ok' && sleep 8 && (adb shell pidof com.pocketpallite || adb shell dumpsys activity top | grep -q 'com.pocketpallite/com.pocketpal.MainActivity') || (adb logcat -d -t 500 && exit 1)
+            WAIT_SECONDS=12 ./scripts/smoke-test-android.sh release/MobiGPT-api-release-x86_64.apk smoke-output
+      - name: Upload startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MobiGPT-smoke-api27
+          path: smoke-output/
+          if-no-files-found: warn
+          retention-days: 14
+
+  smoke_test_android10:
+    name: Smoke-test x86_64 release APK on Android 10/API 29
+    needs: build_release_apks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Download x86_64 release APK
+        uses: actions/download-artifact@v8
+        with:
+          name: MobiGPT-api-release-x86_64
+          path: release
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install and launch exact release APK twice
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          emulator-boot-timeout: 900
+          disable-animations: true
+          script: |
+            WAIT_SECONDS=12 ./scripts/smoke-test-android.sh release/MobiGPT-api-release-x86_64.apk smoke-output
+      - name: Upload startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MobiGPT-smoke-api29
+          path: smoke-output/
+          if-no-files-found: warn
+          retention-days: 14
+
+  smoke_test_arm64:
+    name: Smoke-test ARM64 release APK on ARM64 runner/API 30
+    needs: build_release_apks
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Download ARM64 release APK
+        uses: actions/download-artifact@v8
+        with:
+          name: MobiGPT-api-release-arm64-v8a
+          path: release
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install and launch exact ARM64 release APK twice
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: default
+          arch: arm64-v8a
+          profile: pixel_2
+          emulator-boot-timeout: 1200
+          disable-animations: true
+          script: |
+            WAIT_SECONDS=12 ./scripts/smoke-test-android.sh release/MobiGPT-api-release-arm64-v8a.apk smoke-output
+      - name: Upload ARM64 startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MobiGPT-smoke-arm64-api30
+          path: smoke-output/
+          if-no-files-found: warn
+          retention-days: 14
+
+  smoke_test_aab_x86_64:
+    name: Smoke-test AAB-generated x86_64 APK set
+    needs: build_release_aab
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Download AAB validation artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: MobiGPT-api-release-aab
+          path: aab
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install and launch AAB-generated split APKs twice
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          emulator-boot-timeout: 900
+          disable-animations: true
+          script: |
+            adb install-multiple -r aab/aab-x86_64-apks/*.apk > aab-install.txt 2>&1
+            WAIT_SECONDS=12 ./scripts/smoke-test-android.sh --installed smoke-output
+      - name: Upload AAB startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MobiGPT-smoke-aab-x86_64
+          path: |
+            smoke-output/
+            aab-install.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  smoke_test_aab_arm64:
+    name: Smoke-test AAB-generated ARM64 APK set
+    needs: build_release_aab
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Download AAB validation artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: MobiGPT-api-release-aab
+          path: aab
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install and launch AAB-generated ARM64 split APKs twice
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: default
+          arch: arm64-v8a
+          profile: pixel_2
+          emulator-boot-timeout: 1200
+          disable-animations: true
+          script: |
+            adb install-multiple -r aab/aab-arm64-apks/*.apk > aab-install.txt 2>&1
+            WAIT_SECONDS=12 ./scripts/smoke-test-android.sh --installed smoke-output
+      - name: Upload AAB ARM64 startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MobiGPT-smoke-aab-arm64
+          path: |
+            smoke-output/
+            aab-install.txt
+          if-no-files-found: warn
+          retention-days: 14
 
   build_arm64_no_r8:
     name: Build manual ARM64 release diagnostic without R8
@@ -272,3 +518,28 @@ jobs:
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
+
+  release_gate:
+    name: Required optimized release gate
+    if: always()
+    needs:
+      - checks
+      - build_release_apks
+      - build_release_aab
+      - smoke_test
+      - smoke_test_android8
+      - smoke_test_android10
+      - smoke_test_arm64
+      - smoke_test_aab_x86_64
+      - smoke_test_aab_arm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every release validation job to pass
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results"
+          if jq -e 'to_entries | any(.value.result != "success")' <<< "$results" >/dev/null; then
+            echo 'One or more required release validation jobs failed or were cancelled.' >&2
+            exit 1
+          fi
+          echo 'All optimized release validation jobs passed.'

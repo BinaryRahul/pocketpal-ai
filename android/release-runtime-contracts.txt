@@ -1,0 +1,8 @@
+# Classes reached through reflection, JNI, merged native-library mappings, or
+# React Native registration that must survive optimized release shrinking.
+# Lines beginning with # and blank lines are ignored by CI.
+com.facebook.react.devsupport.InspectorFlags
+com.facebook.react.devsupport.CxxInspectorPackagerConnection
+com.facebook.react.devsupport.CxxInspectorPackagerConnection$*
+com.pocketpal.MainApplication
+com.pocketpal.MainActivity
