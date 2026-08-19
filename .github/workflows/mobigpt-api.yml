@@ -157,6 +157,35 @@ jobs:
           script: |
             adb install -r release/MobiGPT-api-release-x86_64.apk && adb shell am force-stop com.pocketpallite && adb logcat -c && adb shell am start -W -n com.pocketpallite/com.pocketpal.MainActivity | grep -q 'Status: ok' && sleep 8 && (adb shell pidof com.pocketpallite || adb shell dumpsys activity top | grep -q 'com.pocketpallite/com.pocketpal.MainActivity') || (adb logcat -d -t 500 && exit 1)
 
+  smoke_test_android8:
+    name: Smoke-test release APK on Android 8.1
+    needs: build_release_apks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Download x86_64 release APK
+        uses: actions/download-artifact@v8
+        with:
+          name: MobiGPT-api-release-x86_64
+          path: release
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install and launch release APK on Android 8.1
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 27
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          emulator-boot-timeout: 900
+          disable-animations: false
+          script: |
+            adb install -r release/MobiGPT-api-release-x86_64.apk && adb shell am force-stop com.pocketpallite && adb logcat -c && adb shell am start -W -n com.pocketpallite/com.pocketpal.MainActivity | grep -q 'Status: ok' && sleep 8 && (adb shell pidof com.pocketpallite || adb shell dumpsys activity top | grep -q 'com.pocketpallite/com.pocketpal.MainActivity') || (adb logcat -d -t 500 && exit 1)
+
   build_debug:
     name: Build manual debug APK
     if: github.event_name == 'workflow_dispatch' && inputs.build_debug == true
