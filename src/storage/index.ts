@@ -1,30 +1,243 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Keychain from 'react-native-keychain';
 
-import {ApiSettings, ChatMessage, DEFAULT_SETTINGS} from '../types';
+import {
+  ApiSettings,
+  ChatMessage,
+  Conversation,
+  ConversationStore,
+  DEFAULT_SETTINGS,
+  cloneSettings,
+  createConversation,
+  getConversationTitle,
+} from '../types';
 
-const SETTINGS_KEY = '@mobigpt/settings/v1';
-const MESSAGES_KEY = '@mobigpt/messages/v1';
-const KEYCHAIN_SERVICE = 'com.pocketpallite.mobigpt.api-key';
+export const SETTINGS_KEY = '@mobigpt/settings/v1';
+export const MESSAGES_KEY = '@mobigpt/messages/v1';
+export const CONVERSATIONS_KEY = '@mobigpt/conversations/v2';
+export const CONVERSATIONS_BACKUP_KEY = '@mobigpt/conversations/v2/backup';
+export const ACTIVE_CONVERSATION_KEY = '@mobigpt/active-conversation/v1';
+export const KEYCHAIN_SERVICE = 'com.pocketpallite.mobigpt.api-key';
+export const MAX_STORAGE_BYTES = 2 * 1024 * 1024;
+export const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
+
+function byteLength(value: string): number {
+  return encodeURIComponent(value).replace(/%[A-F\d]{2}/g, 'x').length;
+}
+
+function makeId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function validateSettings(value: unknown): ApiSettings | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const settings: ApiSettings = {
+    ...DEFAULT_SETTINGS,
+    baseUrl:
+      typeof value.baseUrl === 'string'
+        ? value.baseUrl
+        : DEFAULT_SETTINGS.baseUrl,
+    model:
+      typeof value.model === 'string' ? value.model : DEFAULT_SETTINGS.model,
+    temperature: isFiniteNumber(value.temperature)
+      ? Math.min(2, Math.max(0, value.temperature))
+      : DEFAULT_SETTINGS.temperature,
+    maxTokens: isFiniteNumber(value.maxTokens)
+      ? Math.min(1_000_000, Math.max(1, Math.floor(value.maxTokens)))
+      : DEFAULT_SETTINGS.maxTokens,
+    systemPrompt:
+      typeof value.systemPrompt === 'string'
+        ? value.systemPrompt.slice(0, 32_000)
+        : DEFAULT_SETTINGS.systemPrompt,
+    requestTimeoutMs: isFiniteNumber(value.requestTimeoutMs)
+      ? Math.min(120_000, Math.max(1_000, Math.floor(value.requestTimeoutMs)))
+      : DEFAULT_SETTINGS.requestTimeoutMs,
+    stream:
+      typeof value.stream === 'boolean'
+        ? value.stream
+        : DEFAULT_SETTINGS.stream,
+  };
+
+  return settings;
+}
+
+function validateMessage(value: unknown): ChatMessage | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (
+    typeof value.id !== 'string' ||
+    (value.role !== 'user' && value.role !== 'assistant') ||
+    typeof value.content !== 'string' ||
+    !isFiniteNumber(value.createdAt)
+  ) {
+    return null;
+  }
+
+  const allowedStatuses = new Set([
+    'completed',
+    'streaming',
+    'partial',
+    'stopped',
+    'failed',
+  ]);
+  return {
+    id: value.id,
+    role: value.role,
+    content: value.content.slice(0, MAX_STORAGE_BYTES),
+    createdAt: value.createdAt,
+    ...(isFiniteNumber(value.updatedAt) ? {updatedAt: value.updatedAt} : {}),
+    ...(typeof value.status === 'string' && allowedStatuses.has(value.status)
+      ? {status: value.status as ChatMessage['status']}
+      : {}),
+    ...(typeof value.errorMessage === 'string'
+      ? {errorMessage: value.errorMessage.slice(0, 4_000)}
+      : {}),
+    ...(typeof value.finishReason === 'string'
+      ? {finishReason: value.finishReason.slice(0, 128)}
+      : {}),
+    ...(isRecord(value.usage)
+      ? {
+          usage: {
+            ...(isFiniteNumber(value.usage.promptTokens)
+              ? {promptTokens: value.usage.promptTokens}
+              : {}),
+            ...(isFiniteNumber(value.usage.completionTokens)
+              ? {completionTokens: value.usage.completionTokens}
+              : {}),
+            ...(isFiniteNumber(value.usage.totalTokens)
+              ? {totalTokens: value.usage.totalTokens}
+              : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+function validateConversation(value: unknown): Conversation | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.title !== 'string' ||
+    !Array.isArray(value.messages) ||
+    !isFiniteNumber(value.createdAt) ||
+    !isFiniteNumber(value.updatedAt)
+  ) {
+    return null;
+  }
+
+  const settings = validateSettings(value.settingsSnapshot);
+  const messages = value.messages.map(validateMessage);
+  if (!settings || messages.some(message => message === null)) {
+    return null;
+  }
+
+  return {
+    id: value.id,
+    title: value.title.slice(0, 120) || 'New conversation',
+    messages: messages as ChatMessage[],
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    settingsSnapshot: settings,
+  };
+}
+
+export function validateConversationStore(
+  value: unknown,
+): ConversationStore | null {
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 2 ||
+    !Array.isArray(value.conversations)
+  ) {
+    return null;
+  }
+  const conversations = value.conversations.map(validateConversation);
+  if (conversations.some(conversation => conversation === null)) {
+    return null;
+  }
+  const activeConversationId =
+    typeof value.activeConversationId === 'string'
+      ? value.activeConversationId
+      : undefined;
+  const validIds = new Set(
+    (conversations as Conversation[]).map(conversation => conversation.id),
+  );
+  return {
+    schemaVersion: 2,
+    conversations: conversations as Conversation[],
+    ...(activeConversationId && validIds.has(activeConversationId)
+      ? {activeConversationId}
+      : {}),
+  };
+}
+
+function parseStore(value: string | null): ConversationStore | null {
+  if (!value || byteLength(value) > MAX_STORAGE_BYTES) {
+    return null;
+  }
+  try {
+    return validateConversationStore(JSON.parse(value));
+  } catch {
+    return null;
+  }
+}
+
+async function writeStoreAtomically(store: ConversationStore): Promise<void> {
+  const serialized = JSON.stringify(store);
+  if (byteLength(serialized) > MAX_STORAGE_BYTES) {
+    throw new Error(
+      'Conversation storage limit exceeded. Delete older conversations and try again.',
+    );
+  }
+
+  const previous = await AsyncStorage.getItem(CONVERSATIONS_KEY);
+  try {
+    if (previous) {
+      await AsyncStorage.setItem(CONVERSATIONS_BACKUP_KEY, previous);
+    }
+    await AsyncStorage.setItem(CONVERSATIONS_KEY, serialized);
+  } catch (error) {
+    if (previous) {
+      await AsyncStorage.setItem(CONVERSATIONS_KEY, previous).catch(
+        () => undefined,
+      );
+    }
+    throw error;
+  }
+}
 
 export async function loadSettings(): Promise<ApiSettings> {
   const stored = await AsyncStorage.getItem(SETTINGS_KEY);
   if (!stored) {
-    return DEFAULT_SETTINGS;
+    return cloneSettings(DEFAULT_SETTINGS);
   }
-
   try {
-    return {
-      ...DEFAULT_SETTINGS,
-      ...(JSON.parse(stored) as Partial<ApiSettings>),
-    };
+    return (
+      validateSettings(JSON.parse(stored)) ?? cloneSettings(DEFAULT_SETTINGS)
+    );
   } catch {
-    return DEFAULT_SETTINGS;
+    return cloneSettings(DEFAULT_SETTINGS);
   }
 }
 
 export async function saveSettings(settings: ApiSettings): Promise<void> {
-  await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  const validated =
+    validateSettings(settings) ?? cloneSettings(DEFAULT_SETTINGS);
+  await AsyncStorage.setItem(SETTINGS_KEY, JSON.stringify(validated));
 }
 
 export async function loadApiKey(): Promise<string> {
@@ -45,23 +258,295 @@ export async function saveApiKey(apiKey: string): Promise<void> {
   }
 }
 
-export async function loadMessages(): Promise<ChatMessage[]> {
-  const stored = await AsyncStorage.getItem(MESSAGES_KEY);
-  if (!stored) {
-    return [];
+async function migrateLegacyMessages(): Promise<ConversationStore | null> {
+  const legacyMessages = await AsyncStorage.getItem(MESSAGES_KEY);
+  if (!legacyMessages) {
+    return null;
   }
 
   try {
-    return JSON.parse(stored) as ChatMessage[];
+    const parsed = JSON.parse(legacyMessages);
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    const messages = parsed.map(validateMessage);
+    if (messages.some(message => message === null)) {
+      return null;
+    }
+    const now = Date.now();
+    const conversation: Conversation = {
+      ...createConversation(makeId('conversation'), now),
+      messages: messages as ChatMessage[],
+      title: getConversationTitle(messages as ChatMessage[]),
+      updatedAt: (messages as ChatMessage[]).at(-1)?.createdAt ?? now,
+    };
+    const store: ConversationStore = {
+      schemaVersion: 2,
+      conversations: [conversation],
+      activeConversationId: conversation.id,
+    };
+    await writeStoreAtomically(store);
+    await AsyncStorage.setItem(ACTIVE_CONVERSATION_KEY, conversation.id);
+    await AsyncStorage.removeItem(MESSAGES_KEY);
+    return store;
   } catch {
-    return [];
+    return null;
   }
 }
 
+export async function loadConversationStore(): Promise<ConversationStore> {
+  const primary = parseStore(await AsyncStorage.getItem(CONVERSATIONS_KEY));
+  if (primary) {
+    return primary;
+  }
+
+  const backup = parseStore(
+    await AsyncStorage.getItem(CONVERSATIONS_BACKUP_KEY),
+  );
+  if (backup) {
+    await AsyncStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(backup)).catch(
+      () => undefined,
+    );
+    return backup;
+  }
+
+  const migrated = await migrateLegacyMessages();
+  if (migrated) {
+    return migrated;
+  }
+
+  const now = Date.now();
+  const conversation = createConversation(makeId('conversation'), now);
+  const emptyStore: ConversationStore = {
+    schemaVersion: 2,
+    conversations: [conversation],
+    activeConversationId: conversation.id,
+  };
+  await writeStoreAtomically(emptyStore);
+  return emptyStore;
+}
+
+export async function saveConversationStore(
+  store: ConversationStore,
+): Promise<void> {
+  const validated = validateConversationStore(store);
+  if (!validated) {
+    throw new Error('Invalid conversation store.');
+  }
+  await writeStoreAtomically(validated);
+  if (validated.activeConversationId) {
+    await AsyncStorage.setItem(
+      ACTIVE_CONVERSATION_KEY,
+      validated.activeConversationId,
+    );
+  }
+}
+
+export async function loadMessages(): Promise<ChatMessage[]> {
+  const store = await loadConversationStore();
+  const active = store.conversations.find(
+    conversation => conversation.id === store.activeConversationId,
+  );
+  return active?.messages ?? store.conversations[0]?.messages ?? [];
+}
+
 export async function saveMessages(messages: ChatMessage[]): Promise<void> {
-  await AsyncStorage.setItem(MESSAGES_KEY, JSON.stringify(messages));
+  const store = await loadConversationStore();
+  const activeId = store.activeConversationId ?? store.conversations[0]?.id;
+  if (!activeId) {
+    return;
+  }
+  const now = Date.now();
+  const conversations = store.conversations.map(conversation =>
+    conversation.id === activeId
+      ? {
+          ...conversation,
+          messages,
+          title:
+            conversation.title === 'New conversation'
+              ? getConversationTitle(messages)
+              : conversation.title,
+          updatedAt: now,
+        }
+      : conversation,
+  );
+  await saveConversationStore({
+    ...store,
+    conversations,
+    activeConversationId: activeId,
+  });
+}
+
+export async function createStoredConversation(
+  settings: ApiSettings = DEFAULT_SETTINGS,
+): Promise<Conversation> {
+  const store = await loadConversationStore();
+  const now = Date.now();
+  const conversation = createConversation(
+    makeId('conversation'),
+    now,
+    settings,
+  );
+  await saveConversationStore({
+    schemaVersion: 2,
+    conversations: [...store.conversations, conversation],
+    activeConversationId: conversation.id,
+  });
+  return conversation;
+}
+
+export async function updateConversation(
+  id: string,
+  update: Partial<
+    Pick<Conversation, 'title' | 'messages' | 'settingsSnapshot'>
+  >,
+): Promise<Conversation | null> {
+  const store = await loadConversationStore();
+  const now = Date.now();
+  let updated: Conversation | null = null;
+  const conversations = store.conversations.map(conversation => {
+    if (conversation.id !== id) {
+      return conversation;
+    }
+    updated = {
+      ...conversation,
+      ...update,
+      title: update.title?.trim().slice(0, 120) || conversation.title,
+      updatedAt: now,
+      settingsSnapshot: update.settingsSnapshot
+        ? cloneSettings(update.settingsSnapshot)
+        : conversation.settingsSnapshot,
+    };
+    return updated;
+  });
+  if (!updated) {
+    return null;
+  }
+  await saveConversationStore({
+    ...store,
+    conversations,
+    activeConversationId: id,
+  });
+  return updated;
+}
+
+export async function deleteStoredConversation(id: string): Promise<void> {
+  const store = await loadConversationStore();
+  const remaining = store.conversations.filter(
+    conversation => conversation.id !== id,
+  );
+  if (remaining.length === 0) {
+    const replacement = createConversation(makeId('conversation'), Date.now());
+    remaining.push(replacement);
+  }
+  const activeConversationId = remaining.some(
+    conversation => conversation.id === store.activeConversationId,
+  )
+    ? store.activeConversationId
+    : remaining[0].id;
+  await saveConversationStore({
+    schemaVersion: 2,
+    conversations: remaining,
+    activeConversationId,
+  });
+}
+
+export async function duplicateStoredConversation(
+  id: string,
+): Promise<Conversation | null> {
+  const store = await loadConversationStore();
+  const source = store.conversations.find(
+    conversation => conversation.id === id,
+  );
+  if (!source) {
+    return null;
+  }
+  const now = Date.now();
+  const duplicate: Conversation = {
+    ...source,
+    id: makeId('conversation'),
+    title: `${source.title} copy`.slice(0, 120),
+    messages: source.messages.map(message => ({
+      ...message,
+      id: makeId('message'),
+    })),
+    createdAt: now,
+    updatedAt: now,
+    settingsSnapshot: cloneSettings(source.settingsSnapshot),
+  };
+  await saveConversationStore({
+    schemaVersion: 2,
+    conversations: [...store.conversations, duplicate],
+    activeConversationId: duplicate.id,
+  });
+  return duplicate;
 }
 
 export async function clearMessages(): Promise<void> {
-  await AsyncStorage.removeItem(MESSAGES_KEY);
+  const store = await loadConversationStore();
+  const activeId = store.activeConversationId ?? store.conversations[0]?.id;
+  if (!activeId) {
+    return;
+  }
+  const conversations = store.conversations.map(conversation =>
+    conversation.id === activeId
+      ? {
+          ...conversation,
+          messages: [],
+          title: 'New conversation',
+          updatedAt: Date.now(),
+        }
+      : conversation,
+  );
+  await saveConversationStore({
+    ...store,
+    conversations,
+    activeConversationId: activeId,
+  });
+}
+
+export function serializeConversationExport(store: ConversationStore): string {
+  const exportStore: ConversationStore = {
+    schemaVersion: 2,
+    conversations: store.conversations.map(conversation => ({
+      ...conversation,
+      settingsSnapshot: cloneSettings(conversation.settingsSnapshot),
+    })),
+    ...(store.activeConversationId
+      ? {activeConversationId: store.activeConversationId}
+      : {}),
+  };
+  const serialized = JSON.stringify(exportStore, null, 2);
+  if (byteLength(serialized) > MAX_IMPORT_BYTES) {
+    throw new Error('Export exceeds the supported size limit.');
+  }
+  return serialized;
+}
+
+export function parseConversationImport(serialized: string): ConversationStore {
+  if (byteLength(serialized) > MAX_IMPORT_BYTES) {
+    throw new Error('Import exceeds the supported size limit.');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    throw new Error('Import is not valid JSON.');
+  }
+  const store = validateConversationStore(parsed);
+  if (!store) {
+    throw new Error('Import does not match a supported conversation schema.');
+  }
+  return store;
+}
+
+export async function clearAllLocalData(): Promise<void> {
+  await AsyncStorage.multiRemove([
+    SETTINGS_KEY,
+    MESSAGES_KEY,
+    CONVERSATIONS_KEY,
+    CONVERSATIONS_BACKUP_KEY,
+    ACTIVE_CONVERSATION_KEY,
+  ]);
+  await saveApiKey('');
 }
