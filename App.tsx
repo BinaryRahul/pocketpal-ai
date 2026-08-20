@@ -12,6 +12,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import Clipboard from '@react-native-clipboard/clipboard';
 
 import {ConversationPanel} from './src/components/ConversationPanel';
 import {streamChatCompletion, ChatStream} from './src/api/openai';
@@ -22,6 +23,18 @@ import {
   saveSettings,
 } from './src/storage';
 import {useConversations} from './src/chat/useConversations';
+import {
+  appendAssistantDelta,
+  buildRequestMessages,
+  clearAssistantResponse,
+  deleteMessage,
+  editUserMessage,
+  markAssistantCompleted,
+  markAssistantFailed,
+  markAssistantStopped,
+  prepareRegeneration,
+  prepareRetry,
+} from './src/chat/messageState';
 import {ApiSettings, ChatMessage, DEFAULT_SETTINGS} from './src/types';
 
 const colors = {
@@ -40,7 +53,23 @@ function makeId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function MessageBubble({message}: {message: ChatMessage}) {
+function MessageBubble({
+  message,
+  onCopy,
+  onDelete,
+  onClear,
+  onRetry,
+  onRegenerate,
+  onEdit,
+}: {
+  message: ChatMessage;
+  onCopy: (message: ChatMessage) => void;
+  onDelete: (message: ChatMessage) => void;
+  onClear: (message: ChatMessage) => void;
+  onRetry: (message: ChatMessage) => void;
+  onRegenerate: (message: ChatMessage) => void;
+  onEdit: (message: ChatMessage) => void;
+}) {
   const isUser = message.role === 'user';
   const stateLabel =
     message.status && message.status !== 'completed'
@@ -58,6 +87,43 @@ function MessageBubble({message}: {message: ChatMessage}) {
         {message.errorMessage ? (
           <Text style={styles.errorText}>{message.errorMessage}</Text>
         ) : null}
+        <View style={styles.messageActions}>
+          <Pressable
+            accessibilityLabel="Copy message"
+            onPress={() => onCopy(message)}>
+            <Text style={styles.actionText}>Copy</Text>
+          </Pressable>
+          {isUser ? (
+            <Pressable
+              accessibilityLabel="Edit and resend message"
+              onPress={() => onEdit(message)}>
+              <Text style={styles.actionText}>Edit</Text>
+            </Pressable>
+          ) : (
+            <>
+              <Pressable
+                accessibilityLabel="Regenerate response"
+                onPress={() => onRegenerate(message)}>
+                <Text style={styles.actionText}>Regenerate</Text>
+              </Pressable>
+              <Pressable
+                accessibilityLabel="Retry response"
+                onPress={() => onRetry(message)}>
+                <Text style={styles.actionText}>Retry</Text>
+              </Pressable>
+              <Pressable
+                accessibilityLabel="Clear response"
+                onPress={() => onClear(message)}>
+                <Text style={styles.actionText}>Clear</Text>
+              </Pressable>
+            </>
+          )}
+          <Pressable
+            accessibilityLabel="Delete message"
+            onPress={() => onDelete(message)}>
+            <Text style={[styles.actionText, styles.deleteAction]}>Delete</Text>
+          </Pressable>
+        </View>
       </View>
     </View>
   );
@@ -74,6 +140,11 @@ export default function App() {
   const [localReady, setLocalReady] = useState(false);
   const [status, setStatus] = useState('');
   const streamRef = useRef<ChatStream | null>(null);
+  const generationIdRef = useRef(0);
+  const assistantIdRef = useRef<string | null>(null);
+  const listRef = useRef<FlatList<ChatMessage>>(null);
+  const [followingLatest, setFollowingLatest] = useState(true);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const conversations = useConversations();
 
   useEffect(() => {
@@ -144,20 +215,15 @@ export default function App() {
   ]);
 
   const stopGeneration = useCallback(() => {
+    generationIdRef.current += 1;
     streamRef.current?.close();
     streamRef.current = null;
+    const assistantId = assistantIdRef.current;
+    assistantIdRef.current = null;
+    if (assistantId) {
+      setMessages(previous => markAssistantStopped(previous, assistantId));
+    }
     setStreaming(false);
-    setMessages(previous =>
-      previous.map(message =>
-        message.role === 'assistant' && message.status === 'streaming'
-          ? {
-              ...message,
-              status: message.content ? 'partial' : 'stopped',
-              updatedAt: Date.now(),
-            }
-          : message,
-      ),
-    );
   }, []);
 
   const updateSettings = useCallback(
@@ -206,106 +272,197 @@ export default function App() {
     [conversations, stopGeneration],
   );
 
+  const startGeneration = useCallback(
+    (
+      prompt: string,
+      baseMessages: ChatMessage[],
+      existingAssistantId?: string,
+      appendUser = true,
+    ) => {
+      if (
+        !apiKey.trim() ||
+        !settings.baseUrl.trim() ||
+        !settings.model.trim()
+      ) {
+        setSettingsOpen(true);
+        setStatus(
+          'Add an API key, base URL, and model before sending a message.',
+        );
+        return;
+      }
+
+      const assistantId = existingAssistantId ?? makeId();
+      const userMessage: ChatMessage = {
+        id: makeId(),
+        role: 'user',
+        content: prompt,
+        createdAt: Date.now(),
+        status: 'completed',
+      };
+      const assistantMessage: ChatMessage = {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        createdAt: Date.now(),
+        status: 'streaming',
+      };
+      const requestBase = existingAssistantId
+        ? baseMessages.filter(message => message.id !== existingAssistantId)
+        : baseMessages;
+      const requestMessages = buildRequestMessages(
+        requestBase,
+        settings.systemPrompt,
+        appendUser ? prompt : undefined,
+      );
+      const nextMessages = existingAssistantId
+        ? baseMessages.map(message =>
+            message.id === existingAssistantId ? assistantMessage : message,
+          )
+        : [
+            ...baseMessages,
+            ...(appendUser ? [userMessage] : []),
+            assistantMessage,
+          ];
+
+      const generationId = generationIdRef.current + 1;
+      generationIdRef.current = generationId;
+      assistantIdRef.current = assistantId;
+      setStatus('');
+      setMessages(nextMessages);
+      setStreaming(true);
+
+      const stream = streamChatCompletion(
+        settings,
+        apiKey,
+        requestMessages,
+        delta => {
+          if (generationId !== generationIdRef.current) {
+            return;
+          }
+          setMessages(previous =>
+            appendAssistantDelta(previous, assistantId, delta),
+          );
+        },
+      );
+      streamRef.current = stream;
+
+      stream.done
+        .then(() => {
+          if (generationId === generationIdRef.current) {
+            setMessages(previous =>
+              markAssistantCompleted(previous, assistantId),
+            );
+          }
+        })
+        .catch(error => {
+          if (generationId !== generationIdRef.current) {
+            return;
+          }
+          const message =
+            error instanceof Error ? error.message : 'The API request failed.';
+          setMessages(previous =>
+            markAssistantFailed(previous, assistantId, message),
+          );
+          setStatus(message);
+        })
+        .finally(() => {
+          if (generationId === generationIdRef.current) {
+            streamRef.current = null;
+            assistantIdRef.current = null;
+            setStreaming(false);
+          }
+        });
+    },
+    [apiKey, settings],
+  );
+
   const sendMessage = useCallback(() => {
     const content = input.trim();
     if (!content || streaming) {
       return;
     }
-
-    if (!apiKey.trim() || !settings.baseUrl.trim() || !settings.model.trim()) {
-      setSettingsOpen(true);
-      setStatus(
-        'Add an API key, base URL, and model before sending a message.',
-      );
+    if (editingMessageId) {
+      const edited = editUserMessage(messages, editingMessageId, content);
+      if (edited.prompt) {
+        setEditingMessageId(null);
+        setInput('');
+        setMessages(edited.messages);
+        startGeneration(content, edited.messages, undefined, false);
+      }
       return;
     }
-
-    const userMessage: ChatMessage = {
-      id: makeId(),
-      role: 'user',
-      content,
-      createdAt: Date.now(),
-      status: 'completed',
-    };
-    const assistantMessage: ChatMessage = {
-      id: makeId(),
-      role: 'assistant',
-      content: '',
-      createdAt: Date.now(),
-      status: 'streaming',
-    };
-    const requestMessages = [
-      ...(settings.systemPrompt.trim()
-        ? [{role: 'system' as const, content: settings.systemPrompt.trim()}]
-        : []),
-      ...messages.map(message => ({
-        role: message.role,
-        content: message.content,
-      })),
-      {role: 'user' as const, content},
-    ];
-
     setInput('');
-    setStatus('');
-    setMessages(previous => [...previous, userMessage, assistantMessage]);
-    setStreaming(true);
+    startGeneration(content, messages);
+  }, [editingMessageId, input, messages, startGeneration, streaming]);
 
-    const stream = streamChatCompletion(
-      settings,
-      apiKey,
-      requestMessages,
-      delta => {
-        setMessages(previous =>
-          previous.map(message =>
-            message.id === assistantMessage.id
-              ? {
-                  ...message,
-                  content: message.content + delta,
-                  status: 'streaming',
-                  updatedAt: Date.now(),
-                }
-              : message,
-          ),
-        );
-      },
-    );
-    streamRef.current = stream;
+  const copyMessage = useCallback((message: ChatMessage) => {
+    Clipboard.setString(message.content);
+    setStatus('Message copied.');
+  }, []);
 
-    stream.done
-      .then(() => {
-        setMessages(previous =>
-          previous.map(message =>
-            message.id === assistantMessage.id
-              ? {...message, status: 'completed', updatedAt: Date.now()}
-              : message,
-          ),
+  const deleteChatMessage = useCallback(
+    (message: ChatMessage) => {
+      if (message.id === assistantIdRef.current) {
+        stopGeneration();
+      }
+      setMessages(previous => deleteMessage(previous, message.id));
+    },
+    [stopGeneration],
+  );
+
+  const clearChatResponse = useCallback((message: ChatMessage) => {
+    setMessages(previous => clearAssistantResponse(previous, message.id));
+  }, []);
+
+  const retryResponse = useCallback(
+    (message: ChatMessage) => {
+      if (streaming) {
+        stopGeneration();
+      }
+      const prepared = prepareRetry(messages, message.id);
+      if (prepared.prompt) {
+        setMessages(prepared.messages);
+        startGeneration(
+          prepared.prompt.content,
+          prepared.messages,
+          message.id,
+          false,
         );
-      })
-      .catch(error => {
-        setMessages(previous =>
-          previous.map(message =>
-            message.id === assistantMessage.id
-              ? {
-                  ...message,
-                  status: message.content ? 'partial' : 'failed',
-                  errorMessage:
-                    error instanceof Error
-                      ? error.message
-                      : 'The API request failed.',
-                  updatedAt: Date.now(),
-                }
-              : message,
-          ),
+      }
+    },
+    [messages, startGeneration, stopGeneration, streaming],
+  );
+
+  const regenerateResponse = useCallback(
+    (message: ChatMessage) => {
+      if (streaming) {
+        stopGeneration();
+      }
+      const prepared = prepareRegeneration(messages, message.id);
+      if (prepared.prompt) {
+        setMessages(prepared.messages);
+        startGeneration(
+          prepared.prompt.content,
+          prepared.messages,
+          message.id,
+          false,
         );
-        setStatus(
-          error instanceof Error ? error.message : 'The API request failed.',
-        );
-      })
-      .finally(() => {
-        streamRef.current = null;
-        setStreaming(false);
-      });
-  }, [apiKey, input, messages, settings, streaming]);
+      }
+    },
+    [messages, startGeneration, stopGeneration, streaming],
+  );
+
+  const editChatMessage = useCallback(
+    (message: ChatMessage) => {
+      if (streaming) {
+        stopGeneration();
+      }
+      setEditingMessageId(message.id);
+      setInput(message.content);
+      setStatus('Edit the prompt, then press Send to resend it.');
+    },
+    [stopGeneration, streaming],
+  );
 
   if (!localReady || !conversations.ready) {
     return (
@@ -441,21 +598,60 @@ export default function App() {
         )}
 
         {status ? <Text style={styles.status}>{status}</Text> : null}
-        <FlatList
-          contentContainerStyle={styles.messages}
-          data={messages}
-          keyExtractor={message => message.id}
-          ListEmptyComponent={
-            <View style={styles.emptyState}>
-              <Text style={styles.emptyTitle}>Start a conversation</Text>
-              <Text style={styles.emptyText}>
-                Add your OpenAI-compatible endpoint and API key, then send a
-                message.
-              </Text>
-            </View>
-          }
-          renderItem={({item}) => <MessageBubble message={item} />}
-        />
+        <View style={styles.messageListContainer}>
+          <FlatList
+            ref={listRef}
+            contentContainerStyle={styles.messages}
+            data={messages}
+            keyExtractor={message => message.id}
+            onContentSizeChange={() => {
+              if (followingLatest) {
+                listRef.current?.scrollToEnd({animated: true});
+              }
+            }}
+            onScroll={event => {
+              const {contentOffset, contentSize, layoutMeasurement} =
+                event.nativeEvent;
+              setFollowingLatest(
+                contentOffset.y + layoutMeasurement.height >=
+                  contentSize.height - 48,
+              );
+            }}
+            scrollEventThrottle={16}
+            ListEmptyComponent={
+              <View style={styles.emptyState}>
+                <Text style={styles.emptyTitle}>Start a conversation</Text>
+                <Text style={styles.emptyText}>
+                  Add your OpenAI-compatible endpoint and API key, then send a
+                  message.
+                </Text>
+              </View>
+            }
+            renderItem={({item}) => (
+              <MessageBubble
+                message={item}
+                onClear={clearChatResponse}
+                onCopy={copyMessage}
+                onDelete={deleteChatMessage}
+                onEdit={editChatMessage}
+                onRegenerate={regenerateResponse}
+                onRetry={retryResponse}
+              />
+            )}
+          />
+          {!followingLatest && messages.length > 0 ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Jump to latest message"
+              onPress={() => {
+                listRef.current?.scrollToEnd({animated: true});
+                setFollowingLatest(true);
+              }}
+              style={styles.jumpButton}>
+              <Text style={styles.jumpButtonText}>Jump to latest</Text>
+            </Pressable>
+          ) : null}
+        </View>
         <View style={styles.composer}>
           <TextInput
             editable={!streaming}
@@ -598,6 +794,27 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   messageText: {color: colors.text, fontSize: 15, lineHeight: 21},
+  messageActions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 8,
+  },
+  actionText: {color: colors.accent, fontSize: 10},
+  deleteAction: {color: colors.danger},
+  messageListContainer: {flex: 1},
+  jumpButton: {
+    alignSelf: 'center',
+    backgroundColor: colors.surfaceRaised,
+    borderColor: colors.accent,
+    borderRadius: 16,
+    borderWidth: 1,
+    bottom: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    position: 'absolute',
+  },
+  jumpButtonText: {color: colors.accent, fontSize: 11, fontWeight: '700'},
   errorText: {color: colors.danger, fontSize: 12, marginTop: 6},
   composer: {
     alignItems: 'flex-end',
