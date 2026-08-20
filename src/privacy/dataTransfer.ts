@@ -1,5 +1,11 @@
 import {Share} from 'react-native';
-import DocumentPicker from 'react-native-document-picker';
+import {
+  errorCodes,
+  isErrorWithCode,
+  keepLocalCopy,
+  pick,
+  types,
+} from '@react-native-documents/picker';
 import RNFS from 'react-native-fs';
 
 import {
@@ -25,15 +31,25 @@ export async function exportConversations(): Promise<void> {
 }
 
 export async function importConversations(): Promise<ConversationStore | null> {
-  const document = await DocumentPicker.pickSingle({
-    type: [DocumentPicker.types.plainText, 'application/json'],
-    copyTo: 'cachesDirectory',
+  const [document] = await pick({
+    type: [types.plainText, 'application/json'],
+    mode: 'import',
   });
   if (document.size && document.size > MAX_IMPORT_BYTES) {
     throw new Error('Import exceeds the supported size limit.');
   }
-  const path = document.fileCopyUri ?? document.uri;
-  const serialized = await RNFS.readFile(path, 'utf8');
+  const copies = await keepLocalCopy({
+    files: [
+      {uri: document.uri, fileName: document.name ?? 'mobigpt-import.json'},
+    ],
+    destination: 'cachesDirectory',
+  });
+  if (copies[0].status !== 'success') {
+    throw new Error(
+      copies[0].copyError ?? 'Could not read the selected import file.',
+    );
+  }
+  const serialized = await RNFS.readFile(copies[0].localUri, 'utf8');
   if (byteLength(serialized) > MAX_IMPORT_BYTES) {
     throw new Error('Import exceeds the supported size limit.');
   }
@@ -43,5 +59,5 @@ export async function importConversations(): Promise<ConversationStore | null> {
 }
 
 export function isDocumentPickerCancelled(error: unknown): boolean {
-  return DocumentPicker.isCancel(error);
+  return isErrorWithCode(error) && error.code === errorCodes.OPERATION_CANCELED;
 }
