@@ -1,4 +1,17 @@
-import {attachmentToApiPart, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION} from '../src/media/attachments';
+jest.mock('react-native-image-picker', () => ({
+  launchCamera: jest.fn(),
+  launchImageLibrary: jest.fn(),
+}));
+jest.mock('react-native-image-resizer', () => ({
+  default: {createResizedImage: jest.fn()},
+}));
+jest.mock('react-native-fs', () => ({stat: jest.fn()}));
+
+import {
+  attachmentToApiPart,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_DIMENSION,
+} from '../src/media/attachments';
 import {ImageAttachment} from '../src/types';
 
 describe('image attachments', () => {
