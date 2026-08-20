@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -17,11 +18,19 @@ import Clipboard from '@react-native-clipboard/clipboard';
 import {ConversationPanel} from './src/components/ConversationPanel';
 import {MarkdownMessage} from './src/components/MarkdownMessage';
 import {ProviderPanel} from './src/components/ProviderPanel';
+import {PrivacyPanel} from './src/components/PrivacyPanel';
 import {streamChatCompletion, ChatStream} from './src/api/openai';
 import {loadApiKey, loadSettings} from './src/storage';
 import {useConversations} from './src/chat/useConversations';
 import {useProviders} from './src/providers/useProviders';
 import {providerToApiSettings} from './src/providers/providerProfiles';
+import {usePrivacyLock} from './src/privacy/usePrivacy';
+import {
+  exportConversations,
+  importConversations,
+  isDocumentPickerCancelled,
+} from './src/privacy/dataTransfer';
+import {clearAllLocalData} from './src/storage';
 import {
   appendAssistantDelta,
   buildRequestMessages,
@@ -132,6 +141,7 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(true);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [localReady, setLocalReady] = useState(false);
   const [status, setStatus] = useState('');
@@ -143,6 +153,7 @@ export default function App() {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const conversations = useConversations();
   const providers = useProviders();
+  const privacy = usePrivacyLock();
 
   useEffect(() => {
     let mounted = true;
@@ -462,7 +473,66 @@ export default function App() {
     [stopGeneration, streaming],
   );
 
-  if (!localReady || !conversations.ready) {
+  const handleImport = useCallback(async () => {
+    try {
+      const imported = await importConversations();
+      if (imported) {
+        const active = imported.conversations.find(
+          conversation => conversation.id === imported.activeConversationId,
+        );
+        setMessages(
+          active?.messages ?? imported.conversations[0]?.messages ?? [],
+        );
+        setStatus('Conversations imported.');
+      }
+    } catch (error) {
+      if (!isDocumentPickerCancelled(error)) {
+        setStatus(
+          error instanceof Error
+            ? error.message
+            : 'Could not import conversations.',
+        );
+      }
+    }
+  }, []);
+
+  const handleClearAll = useCallback(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        Alert.alert(
+          'Clear all local data?',
+          'This deletes conversations, drafts, provider profiles, cached metadata, and stored API keys from this device.',
+          [
+            {
+              text: 'Cancel',
+              style: 'cancel',
+              onPress: () => reject(new Error('Cancelled.')),
+            },
+            {
+              text: 'Clear all',
+              style: 'destructive',
+              onPress: () => {
+                clearAllLocalData()
+                  .then(() => {
+                    setMessages([]);
+                    setStatus('All local data cleared.');
+                    resolve();
+                  })
+                  .catch(reject);
+              },
+            },
+          ],
+        );
+      }),
+    [],
+  );
+
+  if (
+    !localReady ||
+    !conversations.ready ||
+    !providers.ready ||
+    !privacy.ready
+  ) {
     return (
       <SafeAreaView style={styles.loadingScreen}>
         <StatusBar
@@ -471,6 +541,29 @@ export default function App() {
         />
         <ActivityIndicator color={colors.accent} />
         <Text style={styles.loadingText}>Loading MobiGPT…</Text>
+      </SafeAreaView>
+    );
+  }
+
+  if (privacy.locked) {
+    return (
+      <SafeAreaView style={styles.loadingScreen}>
+        <StatusBar
+          barStyle="light-content"
+          backgroundColor={colors.background}
+        />
+        <Text style={styles.lockTitle}>MobiGPT is locked</Text>
+        <Text style={styles.loadingText}>
+          Unlock to view local conversations and provider settings.
+        </Text>
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => privacy.unlock().catch(() => undefined)}
+          style={styles.primaryButton}>
+          <Text style={styles.primaryButtonText}>
+            Unlock with {privacy.type ?? 'device security'}
+          </Text>
+        </Pressable>
       </SafeAreaView>
     );
   }
@@ -492,6 +585,12 @@ export default function App() {
               onPress={() => setSettingsOpen(previous => !previous)}
               style={styles.headerButton}>
               <Text style={styles.headerButtonText}>Settings</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => setPrivacyOpen(previous => !previous)}
+              style={styles.headerButton}>
+              <Text style={styles.headerButtonText}>Privacy</Text>
             </Pressable>
           </View>
         </View>
@@ -536,6 +635,19 @@ export default function App() {
             onSelect={providers.selectProvider}
             onTest={providers.testConnection}
             profiles={providers.profiles}
+          />
+        )}
+
+        {privacyOpen && (
+          <PrivacyPanel
+            biometricEnabled={privacy.enabled}
+            biometricSupported={privacy.supported}
+            biometricType={privacy.type}
+            onClearAll={handleClearAll}
+            onDisableBiometric={privacy.disable}
+            onEnableBiometric={privacy.enable}
+            onExport={exportConversations}
+            onImport={handleImport}
           />
         )}
 
@@ -635,7 +747,8 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
   },
-  loadingText: {color: colors.muted, marginTop: 12},
+  loadingText: {color: colors.muted, marginTop: 12, textAlign: 'center'},
+  lockTitle: {color: colors.text, fontSize: 20, fontWeight: '700'},
   header: {
     alignItems: 'center',
     borderBottomColor: colors.border,

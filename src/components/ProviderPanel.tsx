@@ -54,6 +54,7 @@ export function ProviderPanel({
     activeProfile,
   );
   const [apiKey, setApiKey] = useState(activeApiKey);
+  const [showApiKey, setShowApiKey] = useState(false);
   const [status, setStatus] = useState('');
   const [models, setModels] = useState<string[]>([]);
 
@@ -200,20 +201,30 @@ export function ProviderPanel({
             style={styles.input}
             value={draft.baseUrl}
           />
-          <TextInput
-            autoCapitalize="none"
-            autoCorrect={false}
-            onChangeText={setApiKey}
-            placeholder={
-              draft.apiKeyStored
-                ? 'API key stored — enter to replace'
-                : 'API key (stored in Keychain)'
-            }
-            placeholderTextColor={colors.muted}
-            secureTextEntry
-            style={styles.input}
-            value={apiKey}
-          />
+          <View style={styles.keyRow}>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={setApiKey}
+              placeholder={
+                draft.apiKeyStored
+                  ? 'API key stored — enter to replace'
+                  : 'API key (stored in Keychain)'
+              }
+              placeholderTextColor={colors.muted}
+              secureTextEntry={!showApiKey}
+              style={[styles.input, styles.keyInput]}
+              value={apiKey}
+            />
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => setShowApiKey(value => !value)}
+              style={styles.visibilityButton}>
+              <Text style={styles.secondaryText}>
+                {showApiKey ? 'Hide' : 'Show'}
+              </Text>
+            </Pressable>
+          </View>
           <TextInput
             autoCapitalize="none"
             autoCorrect={false}
@@ -358,6 +369,16 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   row: {flexDirection: 'row', gap: 8},
+  keyRow: {alignItems: 'center', flexDirection: 'row', gap: 8},
+  keyInput: {marginBottom: 8},
+  visibilityButton: {
+    borderColor: colors.border,
+    borderRadius: 7,
+    borderWidth: 1,
+    marginBottom: 8,
+    paddingHorizontal: 9,
+    paddingVertical: 8,
+  },
   half: {flex: 1},
   prompt: {minHeight: 54, textAlignVertical: 'top'},
   actionRow: {

@@ -545,13 +545,16 @@ export function parseConversationImport(serialized: string): ConversationStore {
 }
 
 export async function clearAllLocalData(): Promise<void> {
+  const profiles = await loadProviderProfiles();
   await AsyncStorage.multiRemove([
     SETTINGS_KEY,
     MESSAGES_KEY,
     CONVERSATIONS_KEY,
     CONVERSATIONS_BACKUP_KEY,
     ACTIVE_CONVERSATION_KEY,
+    PROVIDER_PROFILES_KEY,
   ]);
+  await Promise.all(profiles.map(profile => deleteProviderApiKey(profile.id)));
   await saveApiKey('');
 }
 

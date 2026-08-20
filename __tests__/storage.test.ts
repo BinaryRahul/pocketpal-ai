@@ -43,17 +43,24 @@ import {
   CONVERSATIONS_BACKUP_KEY,
   CONVERSATIONS_KEY,
   MESSAGES_KEY,
+  clearAllLocalData,
   createStoredConversation,
   deleteStoredConversation,
   duplicateStoredConversation,
   loadConversationStore,
   parseConversationImport,
   saveConversationStore,
+  saveProviderApiKey,
+  saveProviderProfiles,
   serializeConversationExport,
   updateConversation,
   validateConversationStore,
 } from '../src/storage';
-import {DEFAULT_SETTINGS, ConversationStore} from '../src/types';
+import {
+  DEFAULT_SETTINGS,
+  ConversationStore,
+  ProviderProfile,
+} from '../src/types';
 
 describe('conversation storage', () => {
   beforeEach(() => {
@@ -169,5 +176,28 @@ describe('conversation storage', () => {
         conversations: [],
       } as unknown as ConversationStore),
     ).rejects.toThrow('Invalid conversation store');
+  });
+
+  it('clears provider metadata, secure keys, and conversation data together', async () => {
+    const profile: ProviderProfile = {
+      id: 'p1',
+      name: 'Test provider',
+      providerId: 'custom',
+      baseUrl: 'https://example.test/v1',
+      model: 'test-model',
+      temperature: 0.5,
+      maxTokens: 100,
+      systemPrompt: '',
+      apiKeyStored: true,
+      trustedEndpoint: true,
+      capabilities: {streaming: true, multimodal: false, modelDiscovery: true},
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    await saveProviderProfiles([profile]);
+    await saveProviderApiKey(profile.id, 'sk-profile');
+    await clearAllLocalData();
+    expect(mockStorage.size).toBe(0);
+    expect(mockKeychain.size).toBe(0);
   });
 });
