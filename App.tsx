@@ -15,6 +15,7 @@ import {
 import Clipboard from '@react-native-clipboard/clipboard';
 
 import {ConversationPanel} from './src/components/ConversationPanel';
+import {MarkdownMessage} from './src/components/MarkdownMessage';
 import {streamChatCompletion, ChatStream} from './src/api/openai';
 import {
   loadApiKey,
@@ -81,9 +82,7 @@ function MessageBubble({
         <Text style={styles.messageRole}>
           {isUser ? 'You' : `MobiGPT${stateLabel}`}
         </Text>
-        <Text style={styles.messageText} selectable>
-          {message.content || '…'}
-        </Text>
+        <MarkdownMessage content={message.content || '…'} />
         {message.errorMessage ? (
           <Text style={styles.errorText}>{message.errorMessage}</Text>
         ) : null}
