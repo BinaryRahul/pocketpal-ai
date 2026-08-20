@@ -13,16 +13,15 @@ import {
   View,
 } from 'react-native';
 
+import {ConversationPanel} from './src/components/ConversationPanel';
 import {streamChatCompletion, ChatStream} from './src/api/openai';
 import {
-  clearMessages,
   loadApiKey,
-  loadMessages,
   loadSettings,
   saveApiKey,
-  saveMessages,
   saveSettings,
 } from './src/storage';
+import {useConversations} from './src/chat/useConversations';
 import {ApiSettings, ChatMessage, DEFAULT_SETTINGS} from './src/types';
 
 const colors = {
@@ -33,7 +32,6 @@ const colors = {
   text: '#f5f7fa',
   muted: '#9aa7b7',
   accent: '#75a7ff',
-  accentPressed: '#5f8fe0',
   danger: '#ff9b9b',
   userBubble: '#2c5d9f',
 };
@@ -44,13 +42,22 @@ function makeId(): string {
 
 function MessageBubble({message}: {message: ChatMessage}) {
   const isUser = message.role === 'user';
+  const stateLabel =
+    message.status && message.status !== 'completed'
+      ? ` · ${message.status}`
+      : '';
   return (
     <View style={[styles.messageRow, isUser && styles.messageRowUser]}>
       <View style={[styles.messageBubble, isUser && styles.userBubble]}>
-        <Text style={styles.messageRole}>{isUser ? 'You' : 'MobiGPT'}</Text>
+        <Text style={styles.messageRole}>
+          {isUser ? 'You' : `MobiGPT${stateLabel}`}
+        </Text>
         <Text style={styles.messageText} selectable>
           {message.content || '…'}
         </Text>
+        {message.errorMessage ? (
+          <Text style={styles.errorText}>{message.errorMessage}</Text>
+        ) : null}
       </View>
     </View>
   );
@@ -64,29 +71,24 @@ export default function App() {
   const [input, setInput] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(true);
   const [streaming, setStreaming] = useState(false);
-  const [ready, setReady] = useState(false);
+  const [localReady, setLocalReady] = useState(false);
   const [status, setStatus] = useState('');
   const streamRef = useRef<ChatStream | null>(null);
+  const conversations = useConversations();
 
   useEffect(() => {
     let mounted = true;
-
     const restore = async () => {
       try {
-        const [savedSettings, savedMessages] = await Promise.all([
-          loadSettings(),
-          loadMessages(),
-        ]);
+        const savedSettings = await loadSettings();
         if (mounted) {
           setSettings(savedSettings);
-          setMessages(savedMessages);
         }
       } catch {
         if (mounted) {
-          setStatus('Could not restore the previous conversation.');
+          setStatus('Could not restore connection settings.');
         }
       }
-
       try {
         const savedApiKey = await loadApiKey();
         if (mounted) {
@@ -98,12 +100,10 @@ export default function App() {
           setStatus('API key storage is unavailable on this device.');
         }
       }
-
       if (mounted) {
-        setReady(true);
+        setLocalReady(true);
       }
     };
-
     restore();
     return () => {
       mounted = false;
@@ -111,16 +111,53 @@ export default function App() {
     };
   }, []);
 
+  const activeConversation = conversations.activeConversation;
+  const saveConversationMessages = conversations.saveMessages;
+
   useEffect(() => {
-    if (ready) {
-      saveMessages(messages).catch(() => undefined);
+    if (!conversations.ready || !activeConversation) {
+      return;
     }
-  }, [messages, ready]);
+    setMessages(activeConversation.messages);
+    setSettings(activeConversation.settingsSnapshot);
+    setInput('');
+    setStatus('');
+  }, [activeConversation, conversations.ready]);
+
+  useEffect(() => {
+    if (
+      localReady &&
+      conversations.ready &&
+      conversations.activeConversationId
+    ) {
+      saveConversationMessages(
+        conversations.activeConversationId,
+        messages,
+      ).catch(() => undefined);
+    }
+  }, [
+    conversations.activeConversationId,
+    conversations.ready,
+    localReady,
+    messages,
+    saveConversationMessages,
+  ]);
 
   const stopGeneration = useCallback(() => {
     streamRef.current?.close();
     streamRef.current = null;
     setStreaming(false);
+    setMessages(previous =>
+      previous.map(message =>
+        message.role === 'assistant' && message.status === 'streaming'
+          ? {
+              ...message,
+              status: message.content ? 'partial' : 'stopped',
+              updatedAt: Date.now(),
+            }
+          : message,
+      ),
+    );
   }, []);
 
   const updateSettings = useCallback(
@@ -132,21 +169,42 @@ export default function App() {
 
   const persistSettings = useCallback(async () => {
     try {
-      await Promise.all([saveSettings(settings), saveApiKey(apiKeyDraft)]);
+      await Promise.all([
+        saveSettings(settings),
+        saveApiKey(apiKeyDraft),
+        conversations.activeConversationId
+          ? conversations.saveSettings(
+              conversations.activeConversationId,
+              settings,
+            )
+          : Promise.resolve(),
+      ]);
       setApiKey(apiKeyDraft.trim());
       setStatus('Settings saved.');
       setSettingsOpen(false);
     } catch {
       setStatus('Could not save settings on this device.');
     }
-  }, [apiKeyDraft, settings]);
+  }, [apiKeyDraft, conversations, settings]);
 
   const startNewChat = useCallback(async () => {
     stopGeneration();
-    setMessages([]);
-    setStatus('');
-    await clearMessages();
-  }, [stopGeneration]);
+    const conversation = await conversations.createConversation(settings);
+    setMessages(conversation.messages);
+    setStatus('New conversation created.');
+  }, [conversations, settings, stopGeneration]);
+
+  const selectConversation = useCallback(
+    async (id: string) => {
+      stopGeneration();
+      const conversation = await conversations.selectConversation(id);
+      if (conversation) {
+        setMessages(conversation.messages);
+        setSettings(conversation.settingsSnapshot);
+      }
+    },
+    [conversations, stopGeneration],
+  );
 
   const sendMessage = useCallback(() => {
     const content = input.trim();
@@ -167,12 +225,14 @@ export default function App() {
       role: 'user',
       content,
       createdAt: Date.now(),
+      status: 'completed',
     };
     const assistantMessage: ChatMessage = {
       id: makeId(),
       role: 'assistant',
       content: '',
       createdAt: Date.now(),
+      status: 'streaming',
     };
     const requestMessages = [
       ...(settings.systemPrompt.trim()
@@ -198,7 +258,12 @@ export default function App() {
         setMessages(previous =>
           previous.map(message =>
             message.id === assistantMessage.id
-              ? {...message, content: message.content + delta}
+              ? {
+                  ...message,
+                  content: message.content + delta,
+                  status: 'streaming',
+                  updatedAt: Date.now(),
+                }
               : message,
           ),
         );
@@ -207,11 +272,28 @@ export default function App() {
     streamRef.current = stream;
 
     stream.done
+      .then(() => {
+        setMessages(previous =>
+          previous.map(message =>
+            message.id === assistantMessage.id
+              ? {...message, status: 'completed', updatedAt: Date.now()}
+              : message,
+          ),
+        );
+      })
       .catch(error => {
         setMessages(previous =>
           previous.map(message =>
-            message.id === assistantMessage.id && !message.content
-              ? {...message, content: `Error: ${error.message}`}
+            message.id === assistantMessage.id
+              ? {
+                  ...message,
+                  status: message.content ? 'partial' : 'failed',
+                  errorMessage:
+                    error instanceof Error
+                      ? error.message
+                      : 'The API request failed.',
+                  updatedAt: Date.now(),
+                }
               : message,
           ),
         );
@@ -225,7 +307,7 @@ export default function App() {
       });
   }, [apiKey, input, messages, settings, streaming]);
 
-  if (!ready) {
+  if (!localReady || !conversations.ready) {
     return (
       <SafeAreaView style={styles.loadingScreen}>
         <StatusBar
@@ -253,23 +335,35 @@ export default function App() {
             <Pressable
               accessibilityRole="button"
               onPress={() => setSettingsOpen(previous => !previous)}
-              style={({pressed}) => [
-                styles.headerButton,
-                pressed && styles.pressed,
-              ]}>
+              style={styles.headerButton}>
               <Text style={styles.headerButtonText}>Settings</Text>
-            </Pressable>
-            <Pressable
-              accessibilityRole="button"
-              onPress={startNewChat}
-              style={({pressed}) => [
-                styles.headerButton,
-                pressed && styles.pressed,
-              ]}>
-              <Text style={styles.headerButtonText}>New</Text>
             </Pressable>
           </View>
         </View>
+
+        <ConversationPanel
+          activeConversationId={conversations.activeConversationId}
+          conversations={conversations.conversations}
+          onDelete={id =>
+            conversations
+              .deleteConversation(id)
+              .catch(() => setStatus('Could not delete conversation.'))
+          }
+          onDuplicate={id =>
+            conversations
+              .duplicateConversation(id)
+              .catch(() => setStatus('Could not duplicate conversation.'))
+          }
+          onNew={startNewChat}
+          onQueryChange={conversations.setQuery}
+          onRename={(id, title) =>
+            conversations
+              .renameConversation(id, title)
+              .catch(() => setStatus('Could not rename conversation.'))
+          }
+          onSelect={selectConversation}
+          query={conversations.query}
+        />
 
         {settingsOpen && (
           <View style={styles.settingsPanel}>
@@ -336,10 +430,7 @@ export default function App() {
             <Pressable
               accessibilityRole="button"
               onPress={persistSettings}
-              style={({pressed}) => [
-                styles.primaryButton,
-                pressed && styles.pressed,
-              ]}>
+              style={styles.primaryButton}>
               <Text style={styles.primaryButtonText}>Save settings</Text>
             </Pressable>
             <Text style={styles.securityNote}>
@@ -350,7 +441,6 @@ export default function App() {
         )}
 
         {status ? <Text style={styles.status}>{status}</Text> : null}
-
         <FlatList
           contentContainerStyle={styles.messages}
           data={messages}
@@ -366,7 +456,6 @@ export default function App() {
           }
           renderItem={({item}) => <MessageBubble message={item} />}
         />
-
         <View style={styles.composer}>
           <TextInput
             editable={!streaming}
@@ -385,10 +474,9 @@ export default function App() {
             accessibilityRole="button"
             disabled={streaming ? false : !input.trim()}
             onPress={streaming ? stopGeneration : sendMessage}
-            style={({pressed}) => [
+            style={[
               styles.sendButton,
               !streaming && !input.trim() && styles.disabled,
-              pressed && styles.pressed,
             ]}>
             <Text style={styles.sendButtonText}>
               {streaming ? 'Stop' : 'Send'}
@@ -402,7 +490,7 @@ export default function App() {
 
 const styles = StyleSheet.create({
   flex: {flex: 1},
-  screen: {flex: 1, backgroundColor: colors.background},
+  screen: {backgroundColor: colors.background, flex: 1},
   loadingScreen: {
     alignItems: 'center',
     backgroundColor: colors.background,
@@ -510,6 +598,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   messageText: {color: colors.text, fontSize: 15, lineHeight: 21},
+  errorText: {color: colors.danger, fontSize: 12, marginTop: 6},
   composer: {
     alignItems: 'flex-end',
     backgroundColor: colors.surface,
@@ -542,5 +631,4 @@ const styles = StyleSheet.create({
   },
   sendButtonText: {color: '#08101e', fontWeight: '700'},
   disabled: {backgroundColor: colors.border},
-  pressed: {opacity: 0.76},
 });
