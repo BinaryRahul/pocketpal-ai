@@ -1,4 +1,4 @@
-import {ChatMessage} from '../types';
+import {ApiContentPart, ChatMessage, MessageContentPart} from '../types';
 
 export function appendAssistantDelta(
   messages: ChatMessage[],
@@ -169,21 +169,58 @@ export function editUserMessage(
   };
 }
 
+function toApiContent(message: ChatMessage): string | ApiContentPart[] {
+  if (!message.contentParts?.length) {
+    return message.content;
+  }
+  return message.contentParts.map(part =>
+    part.type === 'text'
+      ? {type: 'text' as const, text: part.text}
+      : {type: 'image_url' as const, image_url: {url: part.image.uri}},
+  );
+}
+
+function contentPartsForPrompt(
+  prompt: string,
+  parts?: MessageContentPart[],
+): string | ApiContentPart[] {
+  if (!parts?.length) {
+    return prompt;
+  }
+  return [
+    {type: 'text' as const, text: prompt},
+    ...parts.map(part =>
+      part.type === 'text'
+        ? {type: 'text' as const, text: part.text}
+        : {type: 'image_url' as const, image_url: {url: part.image.uri}},
+    ),
+  ];
+}
+
 export function buildRequestMessages(
   messages: ChatMessage[],
   systemPrompt: string,
   userPrompt?: string,
-): Array<{role: 'system' | 'user' | 'assistant'; content: string}> {
+  userParts?: MessageContentPart[],
+): Array<{
+  role: 'system' | 'user' | 'assistant';
+  content: string | ApiContentPart[];
+}> {
   return [
     ...(systemPrompt.trim()
       ? [{role: 'system' as const, content: systemPrompt.trim()}]
       : []),
     ...messages.map(message => ({
       role: message.role,
-      content: message.content,
+      content: toApiContent(message),
     })),
     ...(userPrompt && userPrompt !== messages.at(-1)?.content
-      ? [{role: 'user' as const, content: userPrompt}]
+      ? [
+          {
+            role: 'user' as const,
+            content: contentPartsForPrompt(userPrompt, userParts),
+          },
+        ]
       : []),
   ];
 }

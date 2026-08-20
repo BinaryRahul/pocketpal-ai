@@ -18,12 +18,17 @@
   "dependencies": {
     "@react-native-async-storage/async-storage": "^2.2.0",
     "@react-native-clipboard/clipboard": "^1.15.0",
+    "@react-native-community/netinfo": "^11.4.1",
+    "@react-native-voice/voice": "^3.2.4",
     "react": "19.1.1",
     "react-native": "0.82.1",
     "react-native-document-picker": "^9.3.1",
     "react-native-fs": "^2.20.0",
+    "react-native-image-picker": "^7.1.2",
+    "react-native-image-resizer": "^1.4.2",
     "react-native-keychain": "^10.0.0",
     "react-native-sse": "^1.2.1",
+    "react-native-tts": "^4.1.1",
     "react-native-url-polyfill": "^3.0.0"
   },
   "devDependencies": {

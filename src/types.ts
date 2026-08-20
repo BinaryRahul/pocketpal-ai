@@ -7,10 +7,33 @@ export type MessageStatus =
   | 'stopped'
   | 'failed';
 
+export type ImageAttachment = {
+  id: string;
+  uri: string;
+  mimeType: string;
+  width?: number;
+  height?: number;
+  sizeBytes?: number;
+};
+
+export type MessageContentPart =
+  | {type: 'text'; text: string}
+  | {type: 'image'; image: ImageAttachment};
+
+export type ApiContentPart =
+  | {type: 'text'; text: string}
+  | {type: 'image_url'; image_url: {url: string}};
+
+export type ChatRequestMessage = {
+  role: MessageRole;
+  content: string | ApiContentPart[];
+};
+
 export type ChatMessage = {
   id: string;
   role: Exclude<MessageRole, 'system'>;
   content: string;
+  contentParts?: MessageContentPart[];
   createdAt: number;
   updatedAt?: number;
   status?: MessageStatus;

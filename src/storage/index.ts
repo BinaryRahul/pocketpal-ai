@@ -8,6 +8,7 @@ import {
   ConversationStore,
   DEFAULT_SETTINGS,
   DEFAULT_PROVIDER_CAPABILITIES,
+  MessageContentPart,
   ProviderProfile,
   cloneSettings,
   createConversation,
@@ -76,6 +77,49 @@ function validateSettings(value: unknown): ApiSettings | null {
   return settings;
 }
 
+function validateContentParts(
+  value: unknown,
+): MessageContentPart[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const parts: MessageContentPart[] = [];
+  for (const part of value) {
+    if (!isRecord(part) || typeof part.type !== 'string') {
+      return undefined;
+    }
+    if (part.type === 'text' && typeof part.text === 'string') {
+      parts.push({type: 'text', text: part.text.slice(0, MAX_STORAGE_BYTES)});
+      continue;
+    }
+    if (part.type === 'image' && isRecord(part.image)) {
+      const image = part.image;
+      if (
+        typeof image.id === 'string' &&
+        typeof image.uri === 'string' &&
+        typeof image.mimeType === 'string'
+      ) {
+        parts.push({
+          type: 'image',
+          image: {
+            id: image.id,
+            uri: image.uri,
+            mimeType: image.mimeType,
+            ...(isFiniteNumber(image.width) ? {width: image.width} : {}),
+            ...(isFiniteNumber(image.height) ? {height: image.height} : {}),
+            ...(isFiniteNumber(image.sizeBytes)
+              ? {sizeBytes: image.sizeBytes}
+              : {}),
+          },
+        });
+        continue;
+      }
+    }
+    return undefined;
+  }
+  return parts;
+}
+
 function validateMessage(value: unknown): ChatMessage | null {
   if (!isRecord(value)) {
     return null;
@@ -100,6 +144,9 @@ function validateMessage(value: unknown): ChatMessage | null {
     id: value.id,
     role: value.role,
     content: value.content.slice(0, MAX_STORAGE_BYTES),
+    ...(validateContentParts(value.contentParts)
+      ? {contentParts: validateContentParts(value.contentParts)}
+      : {}),
     createdAt: value.createdAt,
     ...(isFiniteNumber(value.updatedAt) ? {updatedAt: value.updatedAt} : {}),
     ...(typeof value.status === 'string' && allowedStatuses.has(value.status)

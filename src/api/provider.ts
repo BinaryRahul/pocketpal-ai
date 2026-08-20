@@ -3,15 +3,13 @@ import EventSource from 'react-native-sse';
 import {
   ApiSettings,
   ApiErrorKind,
+  ChatRequestMessage,
   ChatUsage,
   ModelInfo,
   NormalizedApiError,
 } from '../types';
 
-export type ApiMessage = {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
-};
+export type ApiMessage = ChatRequestMessage;
 
 export type ChatRequest = {
   settings: ApiSettings;
