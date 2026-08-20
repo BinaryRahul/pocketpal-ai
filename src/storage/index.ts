@@ -7,6 +7,8 @@ import {
   Conversation,
   ConversationStore,
   DEFAULT_SETTINGS,
+  DEFAULT_PROVIDER_CAPABILITIES,
+  ProviderProfile,
   cloneSettings,
   createConversation,
   getConversationTitle,
@@ -17,7 +19,9 @@ export const MESSAGES_KEY = '@mobigpt/messages/v1';
 export const CONVERSATIONS_KEY = '@mobigpt/conversations/v2';
 export const CONVERSATIONS_BACKUP_KEY = '@mobigpt/conversations/v2/backup';
 export const ACTIVE_CONVERSATION_KEY = '@mobigpt/active-conversation/v1';
+export const PROVIDER_PROFILES_KEY = '@mobigpt/provider-profiles/v1';
 export const KEYCHAIN_SERVICE = 'com.pocketpallite.mobigpt.api-key';
+const PROVIDER_KEYCHAIN_PREFIX = 'com.pocketpallite.mobigpt.provider.';
 export const MAX_STORAGE_BYTES = 2 * 1024 * 1024;
 export const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
 
@@ -549,4 +553,125 @@ export async function clearAllLocalData(): Promise<void> {
     ACTIVE_CONVERSATION_KEY,
   ]);
   await saveApiKey('');
+}
+
+function validateProviderProfile(value: unknown): ProviderProfile | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.name !== 'string' ||
+    typeof value.providerId !== 'string' ||
+    typeof value.baseUrl !== 'string' ||
+    typeof value.model !== 'string' ||
+    !isFiniteNumber(value.temperature) ||
+    !isFiniteNumber(value.maxTokens) ||
+    typeof value.systemPrompt !== 'string' ||
+    typeof value.apiKeyStored !== 'boolean' ||
+    typeof value.trustedEndpoint !== 'boolean' ||
+    !isRecord(value.capabilities) ||
+    typeof value.capabilities.streaming !== 'boolean' ||
+    typeof value.capabilities.multimodal !== 'boolean' ||
+    typeof value.capabilities.modelDiscovery !== 'boolean' ||
+    !isFiniteNumber(value.createdAt) ||
+    !isFiniteNumber(value.updatedAt)
+  ) {
+    return null;
+  }
+  const providerIds = new Set([
+    'openai',
+    'openrouter',
+    'ollama',
+    'lmstudio',
+    'custom',
+  ]);
+  if (!providerIds.has(value.providerId)) {
+    return null;
+  }
+  return {
+    id: value.id,
+    name: value.name.slice(0, 120),
+    providerId: value.providerId as ProviderProfile['providerId'],
+    baseUrl: value.baseUrl.slice(0, 2_000),
+    model: value.model.slice(0, 300),
+    temperature: Math.min(2, Math.max(0, value.temperature)),
+    maxTokens: Math.min(1_000_000, Math.max(1, Math.floor(value.maxTokens))),
+    systemPrompt: value.systemPrompt.slice(0, 32_000),
+    apiKeyStored: value.apiKeyStored,
+    trustedEndpoint: value.trustedEndpoint,
+    capabilities: {
+      streaming: value.capabilities.streaming,
+      multimodal: value.capabilities.multimodal,
+      modelDiscovery: value.capabilities.modelDiscovery,
+    },
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+  };
+}
+
+export async function loadProviderProfiles(): Promise<ProviderProfile[]> {
+  const stored = await AsyncStorage.getItem(PROVIDER_PROFILES_KEY);
+  if (!stored || byteLength(stored) > MAX_STORAGE_BYTES) {
+    return [];
+  }
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.flatMap(profile => {
+      const validated = validateProviderProfile(profile);
+      return validated ? [validated] : [];
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function saveProviderProfiles(
+  profiles: ProviderProfile[],
+): Promise<void> {
+  const serialized = JSON.stringify(
+    profiles.map(profile => ({
+      ...profile,
+      capabilities: {...DEFAULT_PROVIDER_CAPABILITIES, ...profile.capabilities},
+    })),
+  );
+  if (byteLength(serialized) > MAX_STORAGE_BYTES) {
+    throw new Error('Provider profile storage limit exceeded.');
+  }
+  await AsyncStorage.setItem(PROVIDER_PROFILES_KEY, serialized);
+}
+
+function providerKeychainService(profileId: string): string {
+  return `${PROVIDER_KEYCHAIN_PREFIX}${profileId.replace(/[^a-zA-Z0-9_.-]/g, '_')}`;
+}
+
+export async function loadProviderApiKey(profileId: string): Promise<string> {
+  const credentials = await Keychain.getGenericPassword({
+    service: providerKeychainService(profileId),
+  });
+  return credentials ? credentials.password : '';
+}
+
+export async function saveProviderApiKey(
+  profileId: string,
+  apiKey: string,
+): Promise<void> {
+  const service = providerKeychainService(profileId);
+  if (apiKey.trim()) {
+    await Keychain.setGenericPassword('api-key', apiKey.trim(), {
+      service,
+      accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+    });
+  } else {
+    await Keychain.resetGenericPassword({service});
+  }
+}
+
+export async function deleteProviderApiKey(profileId: string): Promise<void> {
+  await Keychain.resetGenericPassword({
+    service: providerKeychainService(profileId),
+  });
 }

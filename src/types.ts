@@ -25,6 +25,45 @@ export type ChatUsage = {
   totalTokens?: number;
 };
 
+export type ProviderId =
+  | 'openai'
+  | 'openrouter'
+  | 'ollama'
+  | 'lmstudio'
+  | 'custom';
+
+export type ProviderCapabilities = {
+  streaming: boolean;
+  multimodal: boolean;
+  modelDiscovery: boolean;
+};
+
+export type ProviderProfile = {
+  id: string;
+  name: string;
+  providerId: ProviderId;
+  baseUrl: string;
+  model: string;
+  temperature: number;
+  maxTokens: number;
+  systemPrompt: string;
+  apiKeyStored: boolean;
+  trustedEndpoint: boolean;
+  capabilities: ProviderCapabilities;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type ModelInfo = {
+  id: string;
+  ownedBy?: string;
+};
+
+export type ProviderValidationError = {
+  field: 'name' | 'baseUrl' | 'model' | 'temperature' | 'maxTokens';
+  message: string;
+};
+
 export type ApiSettings = {
   baseUrl: string;
   model: string;
@@ -66,6 +105,12 @@ export type NormalizedApiError = {
   message: string;
   status?: number;
   retryable: boolean;
+};
+
+export const DEFAULT_PROVIDER_CAPABILITIES: ProviderCapabilities = {
+  streaming: true,
+  multimodal: false,
+  modelDiscovery: true,
 };
 
 export const DEFAULT_SETTINGS: ApiSettings = {

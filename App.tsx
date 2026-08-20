@@ -16,14 +16,12 @@ import Clipboard from '@react-native-clipboard/clipboard';
 
 import {ConversationPanel} from './src/components/ConversationPanel';
 import {MarkdownMessage} from './src/components/MarkdownMessage';
+import {ProviderPanel} from './src/components/ProviderPanel';
 import {streamChatCompletion, ChatStream} from './src/api/openai';
-import {
-  loadApiKey,
-  loadSettings,
-  saveApiKey,
-  saveSettings,
-} from './src/storage';
+import {loadApiKey, loadSettings} from './src/storage';
 import {useConversations} from './src/chat/useConversations';
+import {useProviders} from './src/providers/useProviders';
+import {providerToApiSettings} from './src/providers/providerProfiles';
 import {
   appendAssistantDelta,
   buildRequestMessages,
@@ -131,7 +129,6 @@ function MessageBubble({
 export default function App() {
   const [settings, setSettings] = useState<ApiSettings>(DEFAULT_SETTINGS);
   const [apiKey, setApiKey] = useState('');
-  const [apiKeyDraft, setApiKeyDraft] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(true);
@@ -145,6 +142,7 @@ export default function App() {
   const [followingLatest, setFollowingLatest] = useState(true);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const conversations = useConversations();
+  const providers = useProviders();
 
   useEffect(() => {
     let mounted = true;
@@ -163,7 +161,6 @@ export default function App() {
         const savedApiKey = await loadApiKey();
         if (mounted) {
           setApiKey(savedApiKey);
-          setApiKeyDraft(savedApiKey);
         }
       } catch {
         if (mounted) {
@@ -183,6 +180,15 @@ export default function App() {
 
   const activeConversation = conversations.activeConversation;
   const saveConversationMessages = conversations.saveMessages;
+  const activeProvider = providers.activeProfile;
+
+  useEffect(() => {
+    if (!providers.ready || !activeProvider) {
+      return;
+    }
+    setSettings(providerToApiSettings(activeProvider));
+    setApiKey(providers.apiKey);
+  }, [activeProvider, providers.apiKey, providers.ready]);
 
   useEffect(() => {
     if (!conversations.ready || !activeConversation) {
@@ -225,32 +231,25 @@ export default function App() {
     setStreaming(false);
   }, []);
 
-  const updateSettings = useCallback(
-    <K extends keyof ApiSettings>(key: K, value: ApiSettings[K]) => {
-      setSettings(previous => ({...previous, [key]: value}));
+  const saveProviderProfile = useCallback(
+    async (
+      profile: Parameters<typeof providers.updateProvider>[0],
+      nextApiKey: string,
+    ) => {
+      const saved = await providers.updateProvider(profile, nextApiKey);
+      const nextSettings = providerToApiSettings(saved);
+      setSettings(nextSettings);
+      setApiKey(nextApiKey.trim());
+      if (conversations.activeConversationId) {
+        await conversations.saveSettings(
+          conversations.activeConversationId,
+          nextSettings,
+        );
+      }
+      setStatus('Provider profile saved.');
     },
-    [],
+    [conversations, providers],
   );
-
-  const persistSettings = useCallback(async () => {
-    try {
-      await Promise.all([
-        saveSettings(settings),
-        saveApiKey(apiKeyDraft),
-        conversations.activeConversationId
-          ? conversations.saveSettings(
-              conversations.activeConversationId,
-              settings,
-            )
-          : Promise.resolve(),
-      ]);
-      setApiKey(apiKeyDraft.trim());
-      setStatus('Settings saved.');
-      setSettingsOpen(false);
-    } catch {
-      setStatus('Could not save settings on this device.');
-    }
-  }, [apiKeyDraft, conversations, settings]);
 
   const startNewChat = useCallback(async () => {
     stopGeneration();
@@ -522,78 +521,22 @@ export default function App() {
         />
 
         {settingsOpen && (
-          <View style={styles.settingsPanel}>
-            <Text style={styles.sectionTitle}>Connection</Text>
-            <TextInput
-              autoCapitalize="none"
-              autoCorrect={false}
-              keyboardType="url"
-              onChangeText={value => updateSettings('baseUrl', value)}
-              placeholder="https://api.openai.com/v1"
-              placeholderTextColor={colors.muted}
-              style={styles.input}
-              value={settings.baseUrl}
-            />
-            <TextInput
-              autoCapitalize="none"
-              autoCorrect={false}
-              onChangeText={setApiKeyDraft}
-              placeholder="API key (stored in the device keychain)"
-              placeholderTextColor={colors.muted}
-              secureTextEntry
-              style={styles.input}
-              value={apiKeyDraft}
-            />
-            <TextInput
-              autoCapitalize="none"
-              autoCorrect={false}
-              onChangeText={value => updateSettings('model', value)}
-              placeholder="Model name"
-              placeholderTextColor={colors.muted}
-              style={styles.input}
-              value={settings.model}
-            />
-            <View style={styles.settingsRow}>
-              <TextInput
-                keyboardType="decimal-pad"
-                onChangeText={value =>
-                  updateSettings('temperature', Number(value) || 0)
-                }
-                placeholder="Temperature"
-                placeholderTextColor={colors.muted}
-                style={[styles.input, styles.halfInput]}
-                value={String(settings.temperature)}
-              />
-              <TextInput
-                keyboardType="number-pad"
-                onChangeText={value =>
-                  updateSettings('maxTokens', Number(value) || 1)
-                }
-                placeholder="Max tokens"
-                placeholderTextColor={colors.muted}
-                style={[styles.input, styles.halfInput]}
-                value={String(settings.maxTokens)}
-              />
-            </View>
-            <TextInput
-              multiline
-              onChangeText={value => updateSettings('systemPrompt', value)}
-              placeholder="System prompt"
-              placeholderTextColor={colors.muted}
-              style={[styles.input, styles.promptInput]}
-              value={settings.systemPrompt}
-            />
-            <Pressable
-              accessibilityRole="button"
-              onPress={persistSettings}
-              style={styles.primaryButton}>
-              <Text style={styles.primaryButtonText}>Save settings</Text>
-            </Pressable>
-            <Text style={styles.securityNote}>
-              For production use, prefer a trusted proxy so a provider key is
-              not exposed directly from a mobile app.
-            </Text>
-          </View>
+          <ProviderPanel
+            activeApiKey={providers.apiKey}
+            activeProfile={providers.activeProfile}
+            firstRun={providers.firstRun}
+            onCreate={providers.createProvider}
+            onDeleteKey={providers.removeApiKey}
+            onDiscover={async (profile, key) =>
+              (await providers.discoverModels(profile, key)).map(
+                model => model.id,
+              )
+            }
+            onSave={saveProviderProfile}
+            onSelect={providers.selectProvider}
+            onTest={providers.testConnection}
+            profiles={providers.profiles}
+          />
         )}
 
         {status ? <Text style={styles.status}>{status}</Text> : null}
