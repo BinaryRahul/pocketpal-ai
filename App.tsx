@@ -11,6 +11,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  Image,
   View,
 } from 'react-native';
 import Clipboard from '@react-native-clipboard/clipboard';
@@ -19,6 +20,9 @@ import {ConversationPanel} from './src/components/ConversationPanel';
 import {MarkdownMessage} from './src/components/MarkdownMessage';
 import {ProviderPanel} from './src/components/ProviderPanel';
 import {PrivacyPanel} from './src/components/PrivacyPanel';
+import {AttachmentPicker} from './src/components/AttachmentPicker';
+import {VoiceControls} from './src/components/VoiceControls';
+import {OfflinePanel} from './src/components/OfflinePanel';
 import {streamChatCompletion, ChatStream} from './src/api/openai';
 import {loadApiKey, loadSettings} from './src/storage';
 import {useConversations} from './src/chat/useConversations';
@@ -31,6 +35,9 @@ import {
   isDocumentPickerCancelled,
 } from './src/privacy/dataTransfer';
 import {clearAllLocalData} from './src/storage';
+import {useVoice} from './src/voice/useVoice';
+import {useOfflineQueue} from './src/offline/useOfflineQueue';
+import {loadDrafts, saveDraft} from './src/offline/queue';
 import {
   appendAssistantDelta,
   buildRequestMessages,
@@ -43,7 +50,12 @@ import {
   prepareRegeneration,
   prepareRetry,
 } from './src/chat/messageState';
-import {ApiSettings, ChatMessage, DEFAULT_SETTINGS} from './src/types';
+import {
+  ApiSettings,
+  ChatMessage,
+  DEFAULT_SETTINGS,
+  ImageAttachment,
+} from './src/types';
 
 const colors = {
   background: '#101318',
@@ -90,6 +102,16 @@ function MessageBubble({
           {isUser ? 'You' : `MobiGPT${stateLabel}`}
         </Text>
         <MarkdownMessage content={message.content || '…'} />
+        {message.contentParts
+          ?.flatMap(part => (part.type === 'image' ? [part] : []))
+          .map(part => (
+            <Image
+              key={part.image.id}
+              accessibilityLabel="Image attachment"
+              source={{uri: part.image.uri}}
+              style={styles.messageImage}
+            />
+          ))}
         {message.errorMessage ? (
           <Text style={styles.errorText}>{message.errorMessage}</Text>
         ) : null}
@@ -151,9 +173,18 @@ export default function App() {
   const listRef = useRef<FlatList<ChatMessage>>(null);
   const [followingLatest, setFollowingLatest] = useState(true);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<
+    ImageAttachment[]
+  >([]);
+  const [attachmentWarningAccepted, setAttachmentWarningAccepted] =
+    useState(false);
+  const [offlinePanelOpen, setOfflinePanelOpen] = useState(false);
+  const [offlineQueueEnabled, setOfflineQueueEnabled] = useState(false);
   const conversations = useConversations();
   const providers = useProviders();
   const privacy = usePrivacyLock();
+  const voice = useVoice();
+  const offline = useOfflineQueue();
 
   useEffect(() => {
     let mounted = true;
@@ -207,9 +238,28 @@ export default function App() {
     }
     setMessages(activeConversation.messages);
     setSettings(activeConversation.settingsSnapshot);
-    setInput('');
+    loadDrafts()
+      .then(drafts => setInput(drafts[activeConversation.id] ?? ''))
+      .catch(() => setInput(''));
     setStatus('');
   }, [activeConversation, conversations.ready]);
+
+  useEffect(() => {
+    if (
+      localReady &&
+      conversations.ready &&
+      conversations.activeConversationId
+    ) {
+      saveDraft(conversations.activeConversationId, input).catch(
+        () => undefined,
+      );
+    }
+  }, [
+    conversations.activeConversationId,
+    conversations.ready,
+    input,
+    localReady,
+  ]);
 
   useEffect(() => {
     if (
@@ -287,6 +337,7 @@ export default function App() {
       baseMessages: ChatMessage[],
       existingAssistantId?: string,
       appendUser = true,
+      attachments: ImageAttachment[] = [],
     ) => {
       if (
         !apiKey.trim() ||
@@ -305,6 +356,17 @@ export default function App() {
         id: makeId(),
         role: 'user',
         content: prompt,
+        ...(attachments.length
+          ? {
+              contentParts: [
+                {type: 'text' as const, text: prompt},
+                ...attachments.map(attachment => ({
+                  type: 'image' as const,
+                  image: attachment,
+                })),
+              ],
+            }
+          : {}),
         createdAt: Date.now(),
         status: 'completed',
       };
@@ -322,6 +384,7 @@ export default function App() {
         requestBase,
         settings.systemPrompt,
         appendUser ? prompt : undefined,
+        appendUser ? userMessage.contentParts : undefined,
       );
       const nextMessages = existingAssistantId
         ? baseMessages.map(message =>
@@ -385,9 +448,82 @@ export default function App() {
     [apiKey, settings],
   );
 
+  const offlineFlushRef = useRef(false);
+
+  useEffect(() => {
+    if (
+      !offline.connected ||
+      !offlineQueueEnabled ||
+      !offline.queue.length ||
+      offlineFlushRef.current
+    ) {
+      return;
+    }
+    offlineFlushRef.current = true;
+    offline
+      .flush(async item => {
+        const conversation = await conversations.selectConversation(
+          item.conversationId,
+        );
+        if (!conversation) {
+          throw new Error('Queued conversation no longer exists.');
+        }
+        setMessages(conversation.messages);
+        startGeneration(item.prompt, conversation.messages);
+        const stream = streamRef.current;
+        if (!stream) {
+          throw new Error('Queued provider stream could not start.');
+        }
+        await stream.done;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        offlineFlushRef.current = false;
+      });
+  }, [conversations, offline, offlineQueueEnabled, startGeneration]);
+
   const sendMessage = useCallback(() => {
     const content = input.trim();
-    if (!content || streaming) {
+    if ((!content && !pendingAttachments.length) || streaming) {
+      return;
+    }
+    if (!offline.connected) {
+      if (
+        offlineQueueEnabled &&
+        conversations.activeConversationId &&
+        content
+      ) {
+        offline
+          .queueSend(conversations.activeConversationId, content)
+          .then(() => {
+            setInput('');
+            setStatus(
+              'Prompt queued. It will be sent when connectivity returns.',
+            );
+          })
+          .catch(error =>
+            setStatus(
+              error instanceof Error
+                ? error.message
+                : 'Could not queue prompt.',
+            ),
+          );
+      } else {
+        setStatus(
+          'You are offline. Conversation browsing remains available, but remote generation is unavailable.',
+        );
+      }
+      return;
+    }
+    if (pendingAttachments.length && !attachmentWarningAccepted) {
+      Alert.alert(
+        'Send image to provider?',
+        'The selected provider may receive this image and the conversation. Continue only if you trust the endpoint.',
+        [
+          {text: 'Cancel', style: 'cancel'},
+          {text: 'Continue', onPress: () => setAttachmentWarningAccepted(true)},
+        ],
+      );
       return;
     }
     if (editingMessageId) {
@@ -401,8 +537,21 @@ export default function App() {
       return;
     }
     setInput('');
-    startGeneration(content, messages);
-  }, [editingMessageId, input, messages, startGeneration, streaming]);
+    const attachments = pendingAttachments;
+    setPendingAttachments([]);
+    startGeneration(content, messages, undefined, true, attachments);
+  }, [
+    attachmentWarningAccepted,
+    conversations.activeConversationId,
+    editingMessageId,
+    input,
+    messages,
+    offline,
+    offlineQueueEnabled,
+    pendingAttachments,
+    startGeneration,
+    streaming,
+  ]);
 
   const copyMessage = useCallback((message: ChatMessage) => {
     Clipboard.setString(message.content);
@@ -592,6 +741,14 @@ export default function App() {
               style={styles.headerButton}>
               <Text style={styles.headerButtonText}>Privacy</Text>
             </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => setOfflinePanelOpen(previous => !previous)}
+              style={styles.headerButton}>
+              <Text style={styles.headerButtonText}>
+                {offline.connected ? 'Offline' : 'Offline!'}
+              </Text>
+            </Pressable>
           </View>
         </View>
 
@@ -651,6 +808,16 @@ export default function App() {
           />
         )}
 
+        {offlinePanelOpen && (
+          <OfflinePanel
+            connected={offline.connected}
+            onCancel={offline.cancelQueuedSend}
+            onToggleQueue={setOfflineQueueEnabled}
+            queue={offline.queue}
+            queueEnabled={offlineQueueEnabled}
+          />
+        )}
+
         {status ? <Text style={styles.status}>{status}</Text> : null}
         <View style={styles.messageListContainer}>
           <FlatList
@@ -706,6 +873,50 @@ export default function App() {
             </Pressable>
           ) : null}
         </View>
+        <VoiceControls
+          available={voice.available}
+          onCancel={voice.cancelRecording}
+          onSpeak={() =>
+            voice.speak(
+              [...messages]
+                .reverse()
+                .find(message => message.role === 'assistant')?.content ?? '',
+            )
+          }
+          onStart={voice.startRecording}
+          onStop={async () => {
+            const transcript = await voice.stopRecording();
+            if (transcript)
+              setInput(
+                previous => `${previous}${previous ? ' ' : ''}${transcript}`,
+              );
+          }}
+          onStopSpeaking={voice.stopSpeaking}
+          onUseTranscript={() => {
+            setInput(
+              previous =>
+                `${previous}${previous ? ' ' : ''}${voice.transcript}`,
+            );
+            voice.clearTranscript();
+          }}
+          recording={voice.recording}
+          speaking={voice.speaking}
+          transcript={voice.transcript}
+        />
+        <AttachmentPicker
+          attachments={pendingAttachments}
+          disabled={streaming}
+          onAdd={attachment => {
+            setPendingAttachments(previous => [...previous, attachment]);
+            setAttachmentWarningAccepted(false);
+          }}
+          onError={setStatus}
+          onRemove={id =>
+            setPendingAttachments(previous =>
+              previous.filter(attachment => attachment.id !== id),
+            )
+          }
+        />
         <View style={styles.composer}>
           <TextInput
             editable={!streaming}
@@ -722,11 +933,16 @@ export default function App() {
           />
           <Pressable
             accessibilityRole="button"
-            disabled={streaming ? false : !input.trim()}
+            disabled={
+              streaming ? false : !input.trim() && !pendingAttachments.length
+            }
             onPress={streaming ? stopGeneration : sendMessage}
             style={[
               styles.sendButton,
-              !streaming && !input.trim() && styles.disabled,
+              !streaming &&
+                !input.trim() &&
+                !pendingAttachments.length &&
+                styles.disabled,
             ]}>
             <Text style={styles.sendButtonText}>
               {streaming ? 'Stop' : 'Send'}
@@ -871,6 +1087,15 @@ const styles = StyleSheet.create({
   },
   jumpButtonText: {color: colors.accent, fontSize: 11, fontWeight: '700'},
   errorText: {color: colors.danger, fontSize: 12, marginTop: 6},
+  messageImage: {
+    borderColor: colors.border,
+    borderRadius: 8,
+    borderWidth: 1,
+    height: 180,
+    marginTop: 8,
+    maxWidth: '100%',
+    width: 240,
+  },
   composer: {
     alignItems: 'flex-end',
     backgroundColor: colors.surface,
